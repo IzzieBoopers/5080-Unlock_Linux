@@ -1,0 +1,31 @@
+# Kernel module build output
+*.ko
+*.ko.*
+*.mod
+*.mod.c
+*.o
+*.order
+*.symvers
+*.cmd
+.*.cmd
+# Make dependency files only (do not match modprobe.d/ or modules-load.d/)
+*.o.d
+.*.cmd.d
+*.dwo
+.tmp_versions/
+Module.symvers
+modules.order
+
+# Editor and OS noise
+.DS_Store
+*~
+*.swp
+*.swo
+
+# Runtime logs and scratch output
+*.log
+*.out
+*.tmp
+
+# Internal notes not intended for release archives
+cleanup/

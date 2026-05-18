@@ -1,0 +1,17 @@
+#!/bin/sh
+# Rebuild omen_wmi_boost when a new kernel is installed (Fedora kernel-install.d).
+set -eu
+
+ACTION="${1:?kernel-install action required}"
+KVER="${2:?kernel version required}"
+SCRIPT=/usr/local/sbin/omen-wmi-boost-rebuild
+
+if [ "$ACTION" != "add" ]; then
+	exit 0
+fi
+
+if [ ! -x "$SCRIPT" ]; then
+	exit 0
+fi
+
+"$SCRIPT" "$KVER" || exit 0

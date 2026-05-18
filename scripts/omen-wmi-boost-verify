@@ -1,0 +1,92 @@
+#!/usr/bin/bash
+# Post-boot check: module loaded and GPU boost flags active.
+set -euo pipefail
+
+TAG=omen-wmi-boost
+SYSFS=/sys/kernel/omen_wmi_boost/gpu_state
+LAST_ERROR=/sys/kernel/omen_wmi_boost/last_error
+FAIL_FLAG=/run/omen_wmi_boost.failed
+REBUILD_FLAG=/var/lib/omen_wmi_boost/rebuild-needed
+
+fail() {
+	local reason="$1"
+	local msg="omen_wmi_boost failed: ${reason}"
+
+	logger -t "$TAG" -p user.err "$msg"
+	printf '%s\n%s\n' "$(date -Iseconds)" "$reason" >"$FAIL_FLAG"
+
+	if [[ -f "$REBUILD_FLAG" ]]; then
+		msg="${msg}. Kernel update: run sudo ./install.sh from 5080_Unlock."
+	fi
+
+	notify_sessions "$msg"
+	exit 1
+}
+
+notify_sessions() {
+	local body="$1"
+	local sess user uid stype runtime display pid
+
+	if ! command -v notify-send >/dev/null || ! command -v loginctl >/dev/null; then
+		return 0
+	fi
+
+	while read -r sess user; do
+		[[ -n "$sess" && -n "$user" ]] || continue
+		stype=$(loginctl show-session "$sess" -p Type --value 2>/dev/null) || continue
+		[[ "$stype" == "wayland" || "$stype" == "x11" ]] || continue
+
+		uid=$(id -u "$user" 2>/dev/null) || continue
+		runtime="/run/user/${uid}"
+		[[ -d "$runtime" ]] || continue
+
+		display=":0"
+		for pid in $(pgrep -u "$uid" plasmashell kwin_wayland kwin_x11 2>/dev/null); do
+			if display=$(grep -z '^DISPLAY=' "/proc/${pid}/environ" 2>/dev/null | tr -d '\0' | cut -d= -f2-); then
+				[[ -n "$display" ]] && break
+			fi
+		done
+
+		sudo -u "$user" \
+			DISPLAY="$display" \
+			XDG_RUNTIME_DIR="$runtime" \
+			DBUS_SESSION_BUS_ADDRESS="unix:path=${runtime}/bus" \
+			notify-send -u critical -a "GPU Power Boost" \
+			"GPU power boost failed" \
+			"${body} See: journalctl -t ${TAG} -b" \
+			2>/dev/null || true
+	done < <(loginctl list-sessions --no-legend 2>/dev/null | awk '{print $1, $3}')
+}
+
+pass() {
+	rm -f "$FAIL_FLAG"
+	exit 0
+}
+
+if [[ ! -d /sys/module/omen_wmi_boost ]]; then
+	reason="kernel module not loaded"
+	if [[ -f "$REBUILD_FLAG" ]]; then
+		reason="${reason} (rebuild required after kernel update)"
+	elif [[ -z "$(find "/lib/modules/$(uname -r)" -name 'omen_wmi_boost.ko*' -print -quit 2>/dev/null)" ]]; then
+		reason="${reason} (no .ko for kernel $(uname -r); run: sudo ./install.sh)"
+	fi
+	fail "$reason"
+fi
+
+if [[ ! -r "$SYSFS" ]]; then
+	fail "sysfs $SYSFS missing"
+fi
+
+read -r state <"$SYSFS" || fail "cannot read gpu_state"
+ctgp=$(sed -n 's/.*ctgp=\([0-9]*\).*/\1/p' <<<"$state")
+ppab=$(sed -n 's/.*ppab=\([0-9]*\).*/\1/p' <<<"$state")
+
+if [[ "$ctgp" != "1" || "$ppab" != "1" ]]; then
+	err_detail="gpu_state=${state}"
+	if [[ -r "$LAST_ERROR" ]]; then
+		err_detail="${err_detail}; last_error=$(tr -d '\n' <"$LAST_ERROR")"
+	fi
+	fail "boost not active (${err_detail})"
+fi
+
+pass

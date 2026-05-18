@@ -1,0 +1,8 @@
+# Prefer the one-time installer (installs this + verify service + kernel hook):
+#   sudo ./install.sh
+#
+# Manual copy only if you know what you are doing:
+#   sudo cp modprobe.d/omen_wmi_boost.conf /etc/modprobe.d/
+#   sudo cp modules-load.d/omen_wmi_boost.conf /etc/modules-load.d/
+
+options omen_wmi_boost persist=1 auto_boost=1 thermal_profile=1
