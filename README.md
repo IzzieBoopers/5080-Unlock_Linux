@@ -156,16 +156,6 @@ nvidia-smi -q -d POWER
 
 If WMI state is enabled but power is still capped, check `journalctl -u nvidia-powerd -b` and confirm the laptop is on AC power with adequate cooling.
 
-## Screenshots
-
-Release screenshots should go in `docs/screenshots/`.
-
-Recommended captures:
-
-- Before: 80 W cap, non-P0 state, and approximately 12.5 second AI inference timing.
-- After: approximately 172 W / 175 W, P0 state, and approximately 8 second AI inference timing.
-- Optional: thermal graph, `nvidia-smi` output, and workload timing screenshot.
-
 ## Maintenance
 
 The creator intends to maintain this program only for compatibility fixes, such as Linux, Fedora, kernel, Nvidia driver, or HP firmware updates that break the current behavior. New features, broader hardware support, and general tuning are not guaranteed.
