@@ -1,0 +1,320 @@
+#!/usr/bin/env python3
+"""GPU-aware fan controller for omen_wmi_boost."""
+
+from __future__ import annotations
+
+import argparse
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+
+DEFAULT_SYSFS = Path("/sys/kernel/omen_wmi_boost")
+DEFAULT_INTERVAL = 4
+DEFAULT_IDLE_HOLD = 180
+ACTIVE_TEMP_C = 45
+IDLE_TEMP_C = 35
+CURVE_MIN_TEMP_C = 32
+CURVE_MAX_TEMP_C = 80
+CURVE_MIN_FAN_PERCENT = 5
+CURVE_MAX_FAN_PERCENT = 100
+ACTIVE_UTIL_PERCENT = 5
+ACTIVE_CLOCK_MHZ = 500
+ACTIVE_FAN_FLOOR = 40
+RAMP_UP_STEP = 20
+RAMP_DOWN_STEP = 5
+
+
+class FanControlError(RuntimeError):
+    pass
+
+
+class Controller:
+    def __init__(self, args: argparse.Namespace) -> None:
+        self.sysfs = args.sysfs
+        self.nvidia_smi = args.nvidia_smi
+        self.interval = args.interval
+        self.idle_hold = args.idle_hold
+        self.dry_run = args.dry_run
+        self.once = args.once
+        self.current_percent: int | None = None
+        self.last_busy_at: float | None = None
+        self.running = True
+
+    def log(self, message: str) -> None:
+        print(message, file=sys.stderr, flush=True)
+
+    def run_cmd(self, cmd: list[str], check: bool = True) -> str:
+        try:
+            proc = subprocess.run(
+                cmd,
+                check=False,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=5,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise FanControlError(f"{cmd[0]} failed: {exc}") from exc
+
+        if check and proc.returncode:
+            stderr = proc.stderr.strip()
+            raise FanControlError(
+                f"{' '.join(cmd)} exited {proc.returncode}: {stderr}"
+            )
+
+        return proc.stdout.strip()
+
+    def read_gpu(self) -> tuple[int, int, float, int]:
+        out = self.run_cmd(
+            [
+                self.nvidia_smi,
+                "--query-gpu=temperature.gpu,utilization.gpu,power.draw,clocks.current.graphics",
+                "--format=csv,noheader,nounits",
+            ]
+        )
+        first = next((line for line in out.splitlines() if line.strip()), "")
+        parts = [part.strip() for part in first.split(",")]
+        if len(parts) < 4:
+            raise FanControlError(f"bad nvidia-smi gpu output: {out!r}")
+
+        try:
+            temp = int(float(parts[0]))
+            util = int(float(parts[1]))
+            power = float(parts[2])
+            clock = int(float(parts[3]))
+        except ValueError as exc:
+            raise FanControlError(f"bad nvidia-smi gpu values: {first!r}") from exc
+
+        return temp, util, power, clock
+
+    def read_gpu_pids(self) -> set[int]:
+        pids: set[int] = set()
+
+        compute = self.run_cmd(
+            [
+                self.nvidia_smi,
+                "--query-compute-apps=pid",
+                "--format=csv,noheader,nounits",
+            ],
+            check=False,
+        )
+        for line in compute.splitlines():
+            line = line.strip()
+            if not line or line.startswith("No running"):
+                continue
+            try:
+                pids.add(int(line.split(",", 1)[0].strip()))
+            except ValueError:
+                continue
+
+        pmon = self.run_cmd([self.nvidia_smi, "pmon", "-c", "1"], check=False)
+        for line in pmon.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            fields = line.split()
+            if len(fields) < 2 or fields[1] == "-":
+                continue
+            try:
+                pids.add(int(fields[1]))
+            except ValueError:
+                continue
+
+        return pids
+
+    def read_fan_state(self) -> dict[str, str]:
+        path = self.sysfs / "fan_state"
+        try:
+            data = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise FanControlError(f"cannot read {path}: {exc}") from exc
+
+        state: dict[str, str] = {}
+        for line in data.splitlines():
+            if "=" in line:
+                key, value = line.split("=", 1)
+                state[key.strip()] = value.strip()
+        return state
+
+    def write_sysfs(self, name: str, value: str) -> None:
+        path = self.sysfs / name
+        if self.dry_run:
+            self.log(f"dry-run: write {path} <- {value}")
+            return
+        try:
+            path.write_text(f"{value}\n", encoding="utf-8")
+        except OSError as exc:
+            raise FanControlError(f"cannot write {path}: {exc}") from exc
+
+    def set_auto(self) -> None:
+        self.write_sysfs("fan_mode", "auto")
+
+    def fail_to_auto(self, reason: str) -> None:
+        self.log(f"failure: {reason}; falling back to fan_mode=auto")
+        self.set_auto()
+
+    def curve_percent(self, temp: int, active: bool) -> int:
+        if temp <= CURVE_MIN_TEMP_C:
+            fan = CURVE_MIN_FAN_PERCENT
+        elif temp >= CURVE_MAX_TEMP_C:
+            fan = CURVE_MAX_FAN_PERCENT
+        else:
+            temp_span = CURVE_MAX_TEMP_C - CURVE_MIN_TEMP_C
+            fan_span = CURVE_MAX_FAN_PERCENT - CURVE_MIN_FAN_PERCENT
+            fan = CURVE_MIN_FAN_PERCENT + (
+                (temp - CURVE_MIN_TEMP_C) * fan_span
+            ) // temp_span
+
+        if active:
+            fan = max(fan, ACTIVE_FAN_FLOOR)
+        return max(CURVE_MIN_FAN_PERCENT, min(CURVE_MAX_FAN_PERCENT, fan))
+
+    def rate_limit(self, target: int) -> int:
+        if self.current_percent is None:
+            self.current_percent = target
+            return target
+
+        if target > self.current_percent:
+            self.current_percent = min(target, self.current_percent + RAMP_UP_STEP)
+        elif target < self.current_percent:
+            self.current_percent = max(target, self.current_percent - RAMP_DOWN_STEP)
+
+        return self.current_percent
+
+    def percent_to_speed(self, percent: int, state: dict[str, str]) -> int:
+        try:
+            min_speed = int(state.get("speed_min", "0"))
+            max_speed = int(state.get("speed_max", "60"))
+        except ValueError as exc:
+            raise FanControlError(f"bad fan_state speed values: {state}") from exc
+
+        if max_speed <= min_speed:
+            raise FanControlError(f"invalid fan speed range: {min_speed}..{max_speed}")
+
+        return min_speed + ((max_speed - min_speed) * percent) // 100
+
+    def apply_manual(self, percent: int, state: dict[str, str]) -> None:
+        if state.get("manual_supported") != "1":
+            self.log("manual fan control unsupported; leaving firmware auto")
+            self.set_auto()
+            return
+
+        speed = self.percent_to_speed(percent, state)
+        self.write_sysfs("fan_mode", "manual")
+        self.write_sysfs("fan_speed", str(speed))
+        self.log(f"active: fan={percent}% speed={speed}")
+
+    def should_be_active(
+        self, temp: int, util: int, clock: int, pid_count: int
+    ) -> bool:
+        now = time.monotonic()
+        busy = (
+            util > ACTIVE_UTIL_PERCENT
+            or clock >= ACTIVE_CLOCK_MHZ
+            or temp >= ACTIVE_TEMP_C
+        )
+        idle = (
+            util <= ACTIVE_UTIL_PERCENT
+            and clock < ACTIVE_CLOCK_MHZ
+            and temp <= IDLE_TEMP_C
+        )
+
+        if busy:
+            self.last_busy_at = now
+            return True
+
+        if not idle:
+            return self.last_busy_at is not None
+
+        if self.last_busy_at is None:
+            return False
+
+        if now - self.last_busy_at < self.idle_hold:
+            return True
+
+        self.last_busy_at = None
+        return False
+
+    def tick(self) -> None:
+        temp, util, power, clock = self.read_gpu()
+        pids = self.read_gpu_pids()
+        state = self.read_fan_state()
+
+        active = self.should_be_active(temp, util, clock, len(pids))
+        self.log(
+            "telemetry: "
+            f"temp={temp}C util={util}% clock={clock}MHz power={power:.1f}W "
+            f"pids={len(pids)} active={int(active)}"
+        )
+
+        if active:
+            target = self.curve_percent(temp, active=True)
+            limited = self.rate_limit(target)
+            self.apply_manual(limited, state)
+        else:
+            self.current_percent = None
+            self.set_auto()
+            self.log("idle: fan_mode=auto")
+
+    def loop(self) -> int:
+        signal.signal(signal.SIGTERM, self.stop)
+        signal.signal(signal.SIGINT, self.stop)
+
+        while self.running:
+            try:
+                self.tick()
+            except FanControlError as exc:
+                try:
+                    self.fail_to_auto(str(exc))
+                except FanControlError as fallback_exc:
+                    self.log(f"auto fallback failed: {fallback_exc}")
+                    return 1
+                if self.once:
+                    return 1
+
+            if self.once:
+                return 0
+            time.sleep(self.interval)
+
+        try:
+            self.set_auto()
+        except FanControlError as exc:
+            self.log(f"shutdown auto fallback failed: {exc}")
+            return 1
+        return 0
+
+    def stop(self, signum: int, frame: object) -> None:
+        self.log(f"received signal {signum}; restoring auto mode")
+        self.running = False
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="GPU-aware fan controller for omen_wmi_boost"
+    )
+    parser.add_argument("--sysfs", type=Path, default=DEFAULT_SYSFS)
+    parser.add_argument("--nvidia-smi", default="nvidia-smi")
+    parser.add_argument("--interval", type=int, default=DEFAULT_INTERVAL)
+    parser.add_argument("--idle-hold", type=int, default=DEFAULT_IDLE_HOLD)
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="log intended sysfs writes without changing fan mode",
+    )
+    parser.add_argument(
+        "--once",
+        action="store_true",
+        help="run one control tick and exit",
+    )
+    return parser.parse_args()
+
+
+def main() -> int:
+    return Controller(parse_args()).loop()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

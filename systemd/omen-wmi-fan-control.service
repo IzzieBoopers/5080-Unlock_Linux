@@ -1,0 +1,14 @@
+[Unit]
+Description=GPU-aware HP OMEN fan controller (omen_wmi_boost)
+Documentation=file:/usr/share/doc/omen-wmi-boost/BOOT-SETUP.md
+After=systemd-modules-load.service omen-wmi-boost-verify.service nvidia-powerd.service
+Requires=omen-wmi-boost-verify.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/omen-wmi-fan-control
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target

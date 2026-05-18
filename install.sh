@@ -18,6 +18,7 @@ check_build_deps() {
 	[[ -d "/lib/modules/${KVER}/build" ]] || die \
 		"kernel headers missing for ${KVER}. Install: dnf install kernel-devel-${KVER}"
 	command -v make >/dev/null || die "make not found"
+	command -v python3 >/dev/null || die "python3 not found"
 }
 
 warn_secure_boot() {
@@ -67,14 +68,22 @@ install_scripts() {
 	install -d /usr/local/sbin
 	install -m 755 "${REPO_ROOT}/scripts/omen-wmi-boost-verify" /usr/local/sbin/
 	install -m 755 "${REPO_ROOT}/scripts/omen-wmi-boost-rebuild" /usr/local/sbin/
+	install -m 755 "${REPO_ROOT}/scripts/omen-wmi-fan-control" /usr/local/sbin/
 }
 
 install_systemd() {
-	log "Installing and enabling systemd verify unit"
+	log "Installing systemd units"
 	install -d /etc/systemd/system
 	install -m 644 "${REPO_ROOT}/systemd/omen-wmi-boost-verify.service" /etc/systemd/system/
+	install -m 644 "${REPO_ROOT}/systemd/omen-wmi-fan-control.service" /etc/systemd/system/
 	systemctl daemon-reload
 	systemctl enable omen-wmi-boost-verify.service
+}
+
+enable_fan_controller() {
+	log "Enabling fan controller service"
+	systemctl enable omen-wmi-fan-control.service
+	systemctl restart omen-wmi-fan-control.service
 }
 
 install_kernel_hook() {
@@ -153,9 +162,11 @@ do_dry_run() {
 	show_path_status /etc/modules-load.d/omen_wmi_boost.conf
 	show_path_status /etc/modprobe.d/omen_wmi_boost.conf
 	show_path_status /etc/systemd/system/omen-wmi-boost-verify.service
+	show_path_status /etc/systemd/system/omen-wmi-fan-control.service
 	show_path_status /etc/kernel/install.d/zz-omen-wmi-boost.install
 	show_path_status /usr/local/sbin/omen-wmi-boost-verify
 	show_path_status /usr/local/sbin/omen-wmi-boost-rebuild
+	show_path_status /usr/local/sbin/omen-wmi-fan-control
 
 	if [[ -d /sys/module/omen_wmi_boost ]]; then
 		log "Module is currently loaded"
@@ -165,6 +176,10 @@ do_dry_run() {
 
 	if [[ -r /sys/kernel/omen_wmi_boost/gpu_state ]]; then
 		log "Current GPU state: $(< /sys/kernel/omen_wmi_boost/gpu_state)"
+	fi
+	if [[ -r /sys/kernel/omen_wmi_boost/fan_state ]]; then
+		log "Current fan state:"
+		sed 's/^/  /' /sys/kernel/omen_wmi_boost/fan_state
 	fi
 }
 
@@ -181,6 +196,7 @@ do_install() {
 	install_kernel_hook
 	install_docs
 	smoke_test
+	enable_fan_controller
 	rm -f /var/lib/omen_wmi_boost/rebuild-needed 2>/dev/null || true
 	mkdir -p /var/lib/omen_wmi_boost
 
@@ -195,6 +211,7 @@ do_uninstall() {
 	require_root
 	log "Removing omen_wmi_boost boot persistence"
 
+	systemctl disable --now omen-wmi-fan-control.service 2>/dev/null || true
 	systemctl disable --now omen-wmi-boost-verify.service 2>/dev/null || true
 	rm -f /etc/modprobe.d/omen_wmi_boost.conf
 
@@ -203,9 +220,11 @@ do_uninstall() {
 
 	rm -f /etc/modules-load.d/omen_wmi_boost.conf
 	rm -f /etc/systemd/system/omen-wmi-boost-verify.service
+	rm -f /etc/systemd/system/omen-wmi-fan-control.service
 	rm -f /etc/kernel/install.d/zz-omen-wmi-boost.install
 	rm -f /usr/local/sbin/omen-wmi-boost-verify
 	rm -f /usr/local/sbin/omen-wmi-boost-rebuild
+	rm -f /usr/local/sbin/omen-wmi-fan-control
 	rm -f /run/omen_wmi_boost.failed
 
 	find "/lib/modules/${KVER}" -name 'omen_wmi_boost.ko*' -delete 2>/dev/null || true
