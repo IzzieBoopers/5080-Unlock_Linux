@@ -1,9 +1,29 @@
 #!/usr/bin/bash
+# SPDX-License-Identifier: MIT
 # Rebuild omen_wmi_boost.ko for a specific kernel version.
 set -euo pipefail
 
 SRCDIR=/usr/src/omen_wmi_boost
 TAG=omen-wmi-boost
+STATE_DIR=/var/lib/omen_wmi_boost
+REBUILD_FLAG="${STATE_DIR}/rebuild-needed"
+
+mark_rebuild_needed() {
+	mkdir -p "$STATE_DIR"
+	touch "$REBUILD_FLAG"
+}
+
+build_failed() {
+	local status=$?
+
+	if [[ $status -ne 0 ]]; then
+		mark_rebuild_needed
+		logger -t "$TAG" -p user.err \
+			"omen_wmi_boost: rebuild failed for kernel ${KVER:-unknown} (status ${status})"
+	fi
+}
+
+trap build_failed EXIT
 
 usage() {
 	echo "Usage: $0 <kernel-version>" >&2
@@ -16,14 +36,13 @@ KVER="$1"
 KDIR="/lib/modules/${KVER}/build"
 if [[ ! -d "$KDIR" ]]; then
 	logger -t "$TAG" -p user.err "omen_wmi_boost: no headers for kernel ${KVER}"
-	mkdir -p /var/lib/omen_wmi_boost
-	touch /var/lib/omen_wmi_boost/rebuild-needed
+	mark_rebuild_needed
 	exit 1
 fi
 
 if [[ ! -f "${SRCDIR}/omen_wmi_boost.c" ]]; then
 	logger -t "$TAG" -p user.err "omen_wmi_boost: source missing at ${SRCDIR}"
-	touch /var/lib/omen_wmi_boost/rebuild-needed
+	mark_rebuild_needed
 	exit 1
 fi
 
@@ -34,5 +53,13 @@ make -C "$KDIR" M="$SRCDIR" modules
 make -C "$KDIR" M="$SRCDIR" modules_install
 
 depmod -a "$KVER"
-rm -f /var/lib/omen_wmi_boost/rebuild-needed
-logger -t "$TAG" -p user.info "omen_wmi_boost installed for kernel ${KVER}"
+installed=$(modinfo -k "$KVER" -n omen_wmi_boost 2>/dev/null || true)
+if [[ -z "$installed" ]]; then
+	logger -t "$TAG" -p user.err \
+		"omen_wmi_boost: depmod cannot locate rebuilt module for ${KVER}"
+	exit 1
+fi
+rm -f "$REBUILD_FLAG"
+logger -t "$TAG" -p user.info \
+	"omen_wmi_boost installed for kernel ${KVER}: ${installed}"
+trap - EXIT

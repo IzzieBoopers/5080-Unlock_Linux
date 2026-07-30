@@ -5,6 +5,7 @@
  */
 
 #include <linux/acpi.h>
+#include <linux/delay.h>
 #include <linux/dmi.h>
 #include <linux/init.h>
 #include <linux/kernel.h>
@@ -13,6 +14,7 @@
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/sysfs.h>
+#include <linux/workqueue.h>
 
 #define DRV_NAME			"omen_wmi_boost"
 #define HPWMI_BIOS_GUID			"5FB7F034-2C63-45E9-BE91-3D44E2C707E4"
@@ -23,10 +25,28 @@
 #define HPWMI_SET_GPU_THERMAL_MODES	0x22
 #define HPWMI_SET_PERFORMANCE_MODE	0x1a
 #define HPWMI_FAN_COUNT_GET_QUERY	0x10
+#define HPWMI_FAN_SPEED_GET_QUERY	0x11
+#define HPWMI_FAN_SPEED_MAX_GET_QUERY	0x26
+#define HPWMI_FAN_SPEED_MAX_SET_QUERY	0x27
 #define HPWMI_GET_SYSTEM_DESIGN_DATA	0x28
+#define HPWMI_VICTUS_S_FAN_SPEED_GET_QUERY	0x2d
+#define HPWMI_VICTUS_S_FAN_SPEED_SET_QUERY	0x2e
+#define HPWMI_VICTUS_S_GET_FAN_TABLE_QUERY	0x2f
 
 #define HP_THERMAL_VICTUS_S_PERFORMANCE	0x01
 #define HP_THERMAL_OMEN_V1_PERFORMANCE	0x31
+#define HP_FAN_SPEED_AUTOMATIC		0x00
+
+#define HP_FAN_CPU			0
+#define HP_FAN_GPU			1
+#define HP_FAN_KEEPALIVE_SECS		90
+#define HP_FAN_DEFAULT_MAX_SPEED	60
+
+#define HP_GPU_ATIF_AFNC_PATH		"\\_SB.PCI0.GPPA.VGA.AFNC"
+#define HP_GPU_ATIF_DEFAULT_TARGET	0
+#define HP_GPU_ATIF_DEFAULT_RAW_LIMIT	0x0000015e
+#define OMEN_SUPPORTED_BOARD_NAME	"8D87"
+#define OMEN_SUPPORTED_PRODUCT_NAME	"OMEN MAX Gaming Laptop 16-ak0xxx"
 
 #define HPWMI_RET_UNKNOWN_COMMAND	0x03
 #define HPWMI_RET_UNKNOWN_CMDTYPE	0x04
@@ -53,11 +73,51 @@ struct gpu_power_modes {
 	u8 slowdown_temp;
 };
 
+struct victus_s_fan_table_header {
+	u8 num_fans;
+	u8 unknown;
+} __packed;
+
+struct victus_s_fan_table_entry {
+	u8 cpu_speed;
+	u8 gpu_speed;
+	u8 noise_db;
+} __packed;
+
+struct victus_s_fan_table {
+	struct victus_s_fan_table_header header;
+	struct victus_s_fan_table_entry entries[];
+} __packed;
+
+enum fan_control_mode {
+	FAN_MODE_MAX = 0,
+	FAN_MODE_MANUAL = 1,
+	FAN_MODE_AUTO = 2,
+};
+
+struct fan_control_state {
+	enum fan_control_mode mode;
+	u8 manual_speed;
+	u8 min_speed;
+	u8 max_speed;
+	int gpu_delta;
+	bool manual_supported;
+	bool table_valid;
+	bool max_supported;
+	int last_error;
+	struct delayed_work keepalive;
+};
+
 /* --- module parameters --------------------------------------------------- */
 
 static bool persist = true;
 module_param(persist, bool, 0444);
 MODULE_PARM_DESC(persist, "Stay loaded and expose sysfs (default: Y)");
+
+static bool force_unsupported;
+module_param(force_unsupported, bool, 0444);
+MODULE_PARM_DESC(force_unsupported,
+		 "Allow loading on an unvalidated board (unsafe; default: N)");
 
 static bool auto_boost;
 module_param(auto_boost, bool, 0444);
@@ -70,6 +130,19 @@ MODULE_PARM_DESC(minimal_packet, "Prefer DASI=0 for GC21 reads");
 static u8 thermal_profile = HP_THERMAL_VICTUS_S_PERFORMANCE;
 module_param(thermal_profile, byte, 0644);
 MODULE_PARM_DESC(thermal_profile, "SET_PERFORMANCE_MODE byte (1 or 0x31)");
+
+static bool gpu_power_request = true;
+module_param(gpu_power_request, bool, 0644);
+MODULE_PARM_DESC(gpu_power_request,
+		 "Request firmware GPU power limit during performance apply");
+
+static uint gpu_power_target = HP_GPU_ATIF_DEFAULT_TARGET;
+module_param(gpu_power_target, uint, 0644);
+MODULE_PARM_DESC(gpu_power_target, "AFNC target graphics controller index");
+
+static uint gpu_power_raw = HP_GPU_ATIF_DEFAULT_RAW_LIMIT;
+module_param(gpu_power_raw, uint, 0644);
+MODULE_PARM_DESC(gpu_power_raw, "AFNC raw GPU power request value");
 
 static char boot_mode[16];
 module_param_string(boot_mode, boot_mode, sizeof(boot_mode), 0444);
@@ -88,6 +161,7 @@ static struct {
 	struct mutex lock;
 	bool wmi_ready;
 	char last_error[128];
+	struct fan_control_state fan;
 } omen_drv;
 
 /* --- WMI core (mirrors hp_wmi_perform_query) ----------------------------- */
@@ -220,6 +294,306 @@ static int fan_trigger(void)
 	return hp_gm_query(HPWMI_FAN_COUNT_GET_QUERY, data, 1, sizeof(data));
 }
 
+static int fan_count_read(int *count)
+{
+	u8 data[4] = { 0 };
+	int ret;
+
+	ret = hp_gm_query(HPWMI_FAN_COUNT_GET_QUERY, data, 1, sizeof(data));
+	if (ret)
+		return ret;
+
+	*count = data[0];
+	return 0;
+}
+
+static int fan_rpm_read_legacy(int fan, int *rpm)
+{
+	u8 data[4] = { fan, 0, 0, 0 };
+	int ret;
+
+	ret = hp_gm_query(HPWMI_FAN_SPEED_GET_QUERY, data, 1, sizeof(data));
+	if (ret)
+		return ret;
+
+	*rpm = (data[2] << 8) | data[3];
+	return 0;
+}
+
+static int fan_rpm_read_victus_s(int fan, int *rpm)
+{
+	u8 data[128] = { 0 };
+	int ret;
+
+	if (fan < 0 || fan >= sizeof(data))
+		return -EINVAL;
+
+	ret = hp_gm_query(HPWMI_VICTUS_S_FAN_SPEED_GET_QUERY, data, 1,
+			  sizeof(data));
+	if (ret)
+		return ret;
+
+	*rpm = data[fan] * 100;
+	return 0;
+}
+
+static int fan_rpm_read(int fan, int *rpm)
+{
+	int ret;
+
+	ret = fan_rpm_read_legacy(fan, rpm);
+	if (!ret)
+		return 0;
+
+	return fan_rpm_read_victus_s(fan, rpm);
+}
+
+static int fan_max_get(int *raw)
+{
+	int val = 0;
+	int ret;
+
+	ret = hp_gm_query(HPWMI_FAN_SPEED_MAX_GET_QUERY, &val, sizeof(val),
+			  sizeof(val));
+	if (ret)
+		return ret;
+
+	*raw = val;
+	return 0;
+}
+
+static int fan_max_set(bool enable)
+{
+	int val = enable ? 1 : 0;
+
+	return hp_gm_query(HPWMI_FAN_SPEED_MAX_SET_QUERY, &val, sizeof(val), 0);
+}
+
+static int fan_speed_set(u8 speed)
+{
+	u8 fan_speed[2];
+	int gpu_speed, ret;
+
+	fan_speed[HP_FAN_CPU] = speed;
+	fan_speed[HP_FAN_GPU] = speed;
+
+	if (speed != HP_FAN_SPEED_AUTOMATIC) {
+		gpu_speed = speed + omen_drv.fan.gpu_delta;
+		fan_speed[HP_FAN_GPU] = clamp_val(gpu_speed, 0, U8_MAX);
+	}
+
+	ret = fan_trigger();
+	if (ret)
+		return ret;
+
+	ret = fan_max_set(false);
+	if (ret)
+		return ret;
+
+	return hp_gm_query(HPWMI_VICTUS_S_FAN_SPEED_SET_QUERY, fan_speed,
+			   sizeof(fan_speed), 0);
+}
+
+static int fan_speed_reset(void)
+{
+	return fan_speed_set(HP_FAN_SPEED_AUTOMATIC);
+}
+
+static void fan_set_error(int err)
+{
+	omen_drv.fan.last_error = err;
+}
+
+static void fan_clear_error(void)
+{
+	omen_drv.fan.last_error = 0;
+}
+
+static const char *fan_mode_name(enum fan_control_mode mode)
+{
+	switch (mode) {
+	case FAN_MODE_MAX:
+		return "max";
+	case FAN_MODE_MANUAL:
+		return "manual";
+	case FAN_MODE_AUTO:
+		return "auto";
+	default:
+		return "unknown";
+	}
+}
+
+static int fan_table_probe(bool log)
+{
+	u8 data[128] = { 0 };
+	struct victus_s_fan_table *table = (struct victus_s_fan_table *)data;
+	u8 min_speed = U8_MAX, max_speed = 0;
+	int first_gpu_delta = 0;
+	int entries, i, ret;
+
+	ret = hp_gm_query(HPWMI_VICTUS_S_GET_FAN_TABLE_QUERY, data, 4,
+			  sizeof(data));
+	if (ret) {
+		omen_drv.fan.manual_supported = false;
+		omen_drv.fan.table_valid = false;
+		if (log)
+			pr_warn("fan table read failed: %d\n", ret);
+		return ret;
+	}
+
+	entries = (sizeof(data) - sizeof(*table)) / sizeof(table->entries[0]);
+	for (i = 0; i < entries; i++) {
+		u8 cpu = table->entries[i].cpu_speed;
+		u8 gpu = table->entries[i].gpu_speed;
+		u8 noise = table->entries[i].noise_db;
+
+		if (!cpu && !gpu && !noise)
+			break;
+
+		min_speed = min(min_speed, cpu);
+		max_speed = max(max_speed, cpu);
+		if (!first_gpu_delta)
+			first_gpu_delta = (int)gpu - (int)cpu;
+
+		if (log)
+			pr_info("fan table[%d]: cpu=%u gpu=%u noise_db=%u\n",
+				i, cpu, gpu, noise);
+	}
+
+	if (min_speed == U8_MAX || !max_speed) {
+		omen_drv.fan.manual_supported = false;
+		omen_drv.fan.table_valid = false;
+		if (log)
+			pr_warn("fan table did not contain usable entries\n");
+		return -EINVAL;
+	}
+
+	omen_drv.fan.min_speed = min_speed;
+	omen_drv.fan.max_speed = max_speed;
+	omen_drv.fan.gpu_delta = first_gpu_delta;
+	omen_drv.fan.manual_supported = true;
+	omen_drv.fan.table_valid = true;
+	omen_drv.fan.manual_speed = clamp_val(omen_drv.fan.manual_speed,
+					      min_speed, max_speed);
+
+	if (log)
+		pr_info("fan table: fans=%u min=%u max=%u gpu_delta=%d\n",
+			table->header.num_fans, min_speed, max_speed,
+			first_gpu_delta);
+
+	return 0;
+}
+
+static unsigned long fan_keepalive_delay(void)
+{
+	return msecs_to_jiffies(HP_FAN_KEEPALIVE_SECS * MSEC_PER_SEC);
+}
+
+static int fan_apply_locked(void)
+{
+	int ret;
+
+	switch (omen_drv.fan.mode) {
+	case FAN_MODE_MAX:
+		ret = fan_trigger();
+		if (ret)
+			goto err;
+
+		ret = fan_max_set(true);
+		if (ret)
+			goto err;
+
+		omen_drv.fan.max_supported = true;
+		mod_delayed_work(system_wq, &omen_drv.fan.keepalive,
+				 fan_keepalive_delay());
+		return 0;
+	case FAN_MODE_MANUAL:
+		if (!omen_drv.fan.manual_supported) {
+			ret = fan_table_probe(false);
+			if (ret)
+				goto err;
+		}
+
+		ret = fan_speed_set(omen_drv.fan.manual_speed);
+		if (ret)
+			goto err;
+
+		mod_delayed_work(system_wq, &omen_drv.fan.keepalive,
+				 fan_keepalive_delay());
+		return 0;
+	case FAN_MODE_AUTO:
+		ret = fan_max_set(false);
+		if (ret)
+			goto err;
+
+		if (omen_drv.fan.manual_supported) {
+			ret = fan_speed_reset();
+			if (ret)
+				goto err;
+		}
+
+		cancel_delayed_work(&omen_drv.fan.keepalive);
+		return 0;
+	default:
+		ret = -EINVAL;
+		goto err;
+	}
+
+err:
+	fan_set_error(ret);
+	return ret;
+}
+
+static void fan_keepalive_work(struct work_struct *work)
+{
+	int ret;
+
+	guard(mutex)(&omen_drv.lock);
+	if (omen_drv.fan.mode == FAN_MODE_AUTO)
+		return;
+
+	ret = fan_apply_locked();
+	if (ret)
+		pr_warn_ratelimited("fan keepalive failed: %d\n", ret);
+}
+
+static void fan_control_init(void)
+{
+	omen_drv.fan.mode = FAN_MODE_AUTO;
+	omen_drv.fan.min_speed = 0;
+	omen_drv.fan.max_speed = HP_FAN_DEFAULT_MAX_SPEED;
+	omen_drv.fan.manual_speed = HP_FAN_DEFAULT_MAX_SPEED / 2;
+	omen_drv.fan.gpu_delta = 0;
+	omen_drv.fan.manual_supported = false;
+	omen_drv.fan.table_valid = false;
+	omen_drv.fan.max_supported = false;
+	omen_drv.fan.last_error = 0;
+	INIT_DELAYED_WORK(&omen_drv.fan.keepalive, fan_keepalive_work);
+
+	/*
+	 * This is read-only discovery. It deliberately avoids applying any fan
+	 * mode so the firmware's default automatic policy stays in charge.
+	 */
+	fan_table_probe(false);
+}
+
+static void fan_control_exit(void)
+{
+	int ret;
+
+	cancel_delayed_work_sync(&omen_drv.fan.keepalive);
+
+	guard(mutex)(&omen_drv.lock);
+	if (omen_drv.fan.mode == FAN_MODE_AUTO)
+		return;
+
+	omen_drv.fan.mode = FAN_MODE_AUTO;
+	ret = fan_apply_locked();
+	if (ret)
+		pr_warn("failed to restore firmware automatic fan control: %d\n",
+			ret);
+}
+
 static int thermal_profile_set(u8 profile)
 {
 	char buf[2] = { -1, profile };
@@ -227,30 +601,77 @@ static int thermal_profile_set(u8 profile)
 	return hp_gm_query(HPWMI_SET_PERFORMANCE_MODE, buf, sizeof(buf), 0);
 }
 
+static int gpu_power_limit_request(void)
+{
+	union acpi_object args[2];
+	struct acpi_object_list arg_list = {
+		.count = ARRAY_SIZE(args),
+		.pointer = args,
+	};
+	acpi_handle handle;
+	acpi_status ast;
+
+	if (!gpu_power_request)
+		return 0;
+
+	if (gpu_power_target > U8_MAX)
+		return -EINVAL;
+
+	ast = acpi_get_handle(NULL, HP_GPU_ATIF_AFNC_PATH, &handle);
+	if (ACPI_FAILURE(ast)) {
+		pr_warn("ACPI handle %s not found: %s\n", HP_GPU_ATIF_AFNC_PATH,
+			acpi_format_exception(ast));
+		return -ENODEV;
+	}
+
+	args[0].type = ACPI_TYPE_INTEGER;
+	args[0].integer.value = gpu_power_target;
+	args[1].type = ACPI_TYPE_INTEGER;
+	args[1].integer.value = gpu_power_raw;
+
+	ast = acpi_evaluate_object(handle, NULL, &arg_list, NULL);
+	if (ACPI_FAILURE(ast)) {
+		pr_warn("AFNC target=%u raw=0x%x failed: %s\n",
+			gpu_power_target, gpu_power_raw, acpi_format_exception(ast));
+		return -EIO;
+	}
+
+	pr_info("AFNC target=%u raw=0x%x queued\n",
+		gpu_power_target, gpu_power_raw);
+	return 0;
+}
+
 static int gpu_boost_set(bool enable)
 {
 	struct gpu_power_modes before, after;
-	int ret;
+	int ret, attempt;
 
-	ret = gpu_modes_read(&before);
-	if (ret)
-		return ret;
+	for (attempt = 0; attempt < 5; attempt++) {
+		ret = gpu_modes_read(&before);
+		if (ret)
+			return ret;
 
-	gpu_modes_log(enable ? "enabling" : "disabling", &before);
+		if (attempt == 0)
+			gpu_modes_log(enable ? "enabling" : "disabling", &before);
 
-	ret = gpu_modes_write(enable, &before);
-	if (ret)
-		return ret;
+		ret = gpu_modes_write(enable, &before);
+		if (ret)
+			return ret;
 
-	ret = gpu_modes_read(&after);
-	if (ret)
-		return ret;
+		ret = gpu_modes_read(&after);
+		if (ret)
+			return ret;
 
-	gpu_modes_log("result", &after);
+		gpu_modes_log("result", &after);
 
-	if (enable && (!after.ctgp || !after.ppab))
-		pr_warn("CTGP/DTGP did not stick — check OGHP / thermal profile\n");
+		if (!enable || (after.ctgp && after.ppab))
+			return 0;
 
+		pr_warn("CTGP/DTGP did not stick (attempt %d/5)\n", attempt + 1);
+		msleep(500);
+	}
+
+	pr_warn("CTGP/DTGP did not stick after retries — check OGHP / thermal profile\n");
 	return 0;
 }
 
@@ -270,7 +691,16 @@ static int performance_apply(void)
 	}
 
 	pr_info("thermal profile 0x%02x set\n", thermal_profile);
-	return gpu_boost_set(true);
+
+	ret = gpu_boost_set(true);
+	if (ret)
+		return ret;
+
+	ret = gpu_power_limit_request();
+	if (ret)
+		pr_warn("GPU power-limit request failed (%d), continuing\n", ret);
+
+	return 0;
 }
 
 static int trace_dump(void)
@@ -408,6 +838,176 @@ static ssize_t thermal_profile_store(struct kobject *kobj,
 	return count;
 }
 
+static ssize_t fan_state_show(struct kobject *kobj, struct kobj_attribute *attr,
+			      char *buf)
+{
+	int fan_count = -1, fan_count_ret, fan1_ret, fan2_ret, max_ret;
+	int fan1_rpm = -1, fan2_rpm = -1, max_raw = -1;
+	ssize_t len = 0;
+
+	guard(mutex)(&omen_drv.lock);
+
+	fan_count_ret = fan_count_read(&fan_count);
+	fan1_ret = fan_rpm_read(0, &fan1_rpm);
+	fan2_ret = fan_rpm_read(1, &fan2_rpm);
+	max_ret = fan_max_get(&max_raw);
+	if (!max_ret)
+		omen_drv.fan.max_supported = true;
+
+	len += sysfs_emit_at(buf, len, "mode=%s\n",
+			     fan_mode_name(omen_drv.fan.mode));
+	len += sysfs_emit_at(buf, len, "manual_supported=%u\n",
+			     omen_drv.fan.manual_supported);
+	len += sysfs_emit_at(buf, len, "table_valid=%u\n",
+			     omen_drv.fan.table_valid);
+	len += sysfs_emit_at(buf, len, "speed_min=%u\n",
+			     omen_drv.fan.min_speed);
+	len += sysfs_emit_at(buf, len, "speed_max=%u\n",
+			     omen_drv.fan.max_speed);
+	len += sysfs_emit_at(buf, len, "manual_speed=%u\n",
+			     omen_drv.fan.manual_speed);
+	len += sysfs_emit_at(buf, len, "gpu_delta=%d\n",
+			     omen_drv.fan.gpu_delta);
+	len += sysfs_emit_at(buf, len, "max_supported=%u\n",
+			     omen_drv.fan.max_supported);
+	if (!max_ret)
+		len += sysfs_emit_at(buf, len, "max_raw=%d\n", max_raw);
+	else
+		len += sysfs_emit_at(buf, len, "max_error=%d\n", max_ret);
+
+	if (!fan_count_ret)
+		len += sysfs_emit_at(buf, len, "fan_count=%d\n", fan_count);
+	else
+		len += sysfs_emit_at(buf, len, "fan_count_error=%d\n",
+				     fan_count_ret);
+
+	if (!fan1_ret)
+		len += sysfs_emit_at(buf, len, "fan1_rpm=%d\n", fan1_rpm);
+	else
+		len += sysfs_emit_at(buf, len, "fan1_error=%d\n", fan1_ret);
+
+	if (!fan2_ret)
+		len += sysfs_emit_at(buf, len, "fan2_rpm=%d\n", fan2_rpm);
+	else
+		len += sysfs_emit_at(buf, len, "fan2_error=%d\n", fan2_ret);
+
+	len += sysfs_emit_at(buf, len, "last_fan_error=%d\n",
+			     omen_drv.fan.last_error);
+
+	return len;
+}
+
+static ssize_t fan_mode_show(struct kobject *kobj, struct kobj_attribute *attr,
+			     char *buf)
+{
+	guard(mutex)(&omen_drv.lock);
+	return sysfs_emit(buf, "%s\n", fan_mode_name(omen_drv.fan.mode));
+}
+
+static ssize_t fan_mode_store(struct kobject *kobj, struct kobj_attribute *attr,
+			      const char *buf, size_t count)
+{
+	enum fan_control_mode old_mode, new_mode;
+	int ret;
+
+	if (sysfs_streq(buf, "auto") || sysfs_streq(buf, "2"))
+		new_mode = FAN_MODE_AUTO;
+	else if (sysfs_streq(buf, "manual") || sysfs_streq(buf, "1"))
+		new_mode = FAN_MODE_MANUAL;
+	else if (sysfs_streq(buf, "max") || sysfs_streq(buf, "0"))
+		new_mode = FAN_MODE_MAX;
+	else
+		return -EINVAL;
+
+	guard(mutex)(&omen_drv.lock);
+	old_mode = omen_drv.fan.mode;
+	omen_drv.fan.mode = new_mode;
+	fan_clear_error();
+
+	ret = fan_apply_locked();
+	if (ret) {
+		omen_drv.fan.mode = old_mode;
+		return ret;
+	}
+
+	return count;
+}
+
+static ssize_t fan_speed_show(struct kobject *kobj, struct kobj_attribute *attr,
+			      char *buf)
+{
+	guard(mutex)(&omen_drv.lock);
+	return sysfs_emit(buf, "%u\n", omen_drv.fan.manual_speed);
+}
+
+static ssize_t fan_speed_store(struct kobject *kobj, struct kobj_attribute *attr,
+			       const char *buf, size_t count)
+{
+	unsigned int val;
+	u8 old_speed;
+	int ret;
+
+	if (kstrtouint(buf, 0, &val) || val > U8_MAX)
+		return -EINVAL;
+
+	guard(mutex)(&omen_drv.lock);
+	if (omen_drv.fan.mode != FAN_MODE_MANUAL)
+		return -EINVAL;
+	if (!omen_drv.fan.manual_supported) {
+		ret = fan_table_probe(false);
+		if (ret) {
+			fan_set_error(ret);
+			return ret;
+		}
+	}
+
+	old_speed = omen_drv.fan.manual_speed;
+	omen_drv.fan.manual_speed = clamp_val(val, omen_drv.fan.min_speed,
+					      omen_drv.fan.max_speed);
+	fan_clear_error();
+
+	ret = fan_apply_locked();
+	if (ret) {
+		omen_drv.fan.manual_speed = old_speed;
+		return ret;
+	}
+
+	return count;
+}
+
+static ssize_t fan_probe_store(struct kobject *kobj, struct kobj_attribute *attr,
+			       const char *buf, size_t count)
+{
+	int fan_count = -1, fan1_rpm = -1, fan2_rpm = -1, max_raw = -1;
+	int table_ret, count_ret, fan1_ret, fan2_ret, max_ret;
+
+	if (count > 0 && buf[0] == '0')
+		return -EINVAL;
+
+	guard(mutex)(&omen_drv.lock);
+	table_ret = fan_table_probe(true);
+	count_ret = fan_count_read(&fan_count);
+	fan1_ret = fan_rpm_read(0, &fan1_rpm);
+	fan2_ret = fan_rpm_read(1, &fan2_rpm);
+	max_ret = fan_max_get(&max_raw);
+	if (!max_ret)
+		omen_drv.fan.max_supported = true;
+
+	pr_info("fan probe: table_ret=%d count_ret=%d fan_count=%d\n",
+		table_ret, count_ret, fan_count);
+	pr_info("fan probe: fan1_ret=%d fan1_rpm=%d fan2_ret=%d fan2_rpm=%d\n",
+		fan1_ret, fan1_rpm, fan2_ret, fan2_rpm);
+	pr_info("fan probe: max_ret=%d max_raw=%d manual_supported=%u\n",
+		max_ret, max_raw, omen_drv.fan.manual_supported);
+
+	if (table_ret)
+		fan_set_error(table_ret);
+	else
+		fan_clear_error();
+
+	return count;
+}
+
 static struct kobj_attribute omen_attr_last_error =
 	__ATTR_RO(last_error);
 static struct kobj_attribute omen_attr_gpu_state =
@@ -418,6 +1018,14 @@ static struct kobj_attribute omen_attr_performance =
 	__ATTR_WO(performance);
 static struct kobj_attribute omen_attr_thermal_profile =
 	__ATTR(thermal_profile, 0644, thermal_profile_show, thermal_profile_store);
+static struct kobj_attribute omen_attr_fan_state =
+	__ATTR_RO(fan_state);
+static struct kobj_attribute omen_attr_fan_mode =
+	__ATTR(fan_mode, 0644, fan_mode_show, fan_mode_store);
+static struct kobj_attribute omen_attr_fan_speed =
+	__ATTR(fan_speed, 0644, fan_speed_show, fan_speed_store);
+static struct kobj_attribute omen_attr_fan_probe =
+	__ATTR_WO(fan_probe);
 
 static struct attribute *omen_attrs[] = {
 	&omen_attr_last_error.attr,
@@ -425,6 +1033,10 @@ static struct attribute *omen_attrs[] = {
 	&omen_attr_boost.attr,
 	&omen_attr_performance.attr,
 	&omen_attr_thermal_profile.attr,
+	&omen_attr_fan_state.attr,
+	&omen_attr_fan_mode.attr,
+	&omen_attr_fan_speed.attr,
+	&omen_attr_fan_probe.attr,
 	NULL,
 };
 
@@ -460,6 +1072,8 @@ static int omen_sysfs_init(void)
 static int __init omen_wmi_boost_init(void)
 {
 	const char *once;
+	const char *board;
+	const char *product;
 	int ret = 0;
 
 	if (!wmi_has_guid(HPWMI_BIOS_GUID)) {
@@ -467,8 +1081,22 @@ static int __init omen_wmi_boost_init(void)
 		return -ENODEV;
 	}
 
+	board = dmi_get_system_info(DMI_BOARD_NAME);
+	product = dmi_get_system_info(DMI_PRODUCT_NAME);
+	if (!board || strcmp(board, OMEN_SUPPORTED_BOARD_NAME) ||
+	    !product || strcmp(product, OMEN_SUPPORTED_PRODUCT_NAME)) {
+		if (!force_unsupported) {
+			pr_err("platform board=%s product=%s is not validated; refusing to load (use force_unsupported=1 at your own risk)\n",
+			       board ?: "unknown", product ?: "unknown");
+			return -ENODEV;
+		}
+		pr_warn("UNSAFE override: board=%s product=%s is not validated for these GPU/fan commands\n",
+			board ?: "unknown", product ?: "unknown");
+	}
+
 	omen_drv.wmi_ready = true;
 	mutex_init(&omen_drv.lock);
+	fan_control_init();
 
 	pr_info("board %s — %s\n",
 		dmi_get_system_info(DMI_BOARD_NAME) ?: "unknown",
@@ -481,7 +1109,7 @@ static int __init omen_wmi_boost_init(void)
 		if (ret)
 			return ret;
 
-		pr_info("sysfs: /sys/kernel/%s/{gpu_state,last_error,boost,performance,thermal_profile}\n",
+		pr_info("sysfs: /sys/kernel/%s/{gpu_state,last_error,boost,performance,thermal_profile,fan_state,fan_mode,fan_speed,fan_probe}\n",
 			DRV_NAME);
 
 		if (auto_boost) {
@@ -513,6 +1141,7 @@ static int __init omen_wmi_boost_init(void)
 
 static void __exit omen_wmi_boost_exit(void)
 {
+	fan_control_exit();
 	omen_sysfs_remove();
 }
 
@@ -520,7 +1149,7 @@ module_init(omen_wmi_boost_init);
 module_exit(omen_wmi_boost_exit);
 
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("HP OMEN WMI GPU power unlock");
+MODULE_DESCRIPTION("HP OMEN WMI GPU power unlock and fan control");
 MODULE_AUTHOR("5080_Unlock");
-MODULE_VERSION("1.1");
+MODULE_VERSION("2.0.0");
 MODULE_SOFTDEP("pre: wmi");

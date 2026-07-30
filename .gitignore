@@ -21,6 +21,8 @@ modules.order
 *~
 *.swp
 *.swo
+__pycache__/
+*.py[cod]
 
 # Runtime logs and scratch output
 *.log

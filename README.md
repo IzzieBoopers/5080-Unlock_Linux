@@ -1,195 +1,232 @@
-# 5080 Unlock
+# 5080 Unlock — AI Workload Edition
 
-HP OMEN RTX 5080 Laptop GPU power unlock helper for Linux.
+Linux support for the HP OMEN MAX RTX 5080 Laptop GPU performance state, with a
+GPU-aware fan controller designed for sustained AI workloads.
 
-This project builds and installs `omen_wmi_boost`, a small kernel module that uses HP/OMEN WMI calls to switch the GPU out of the default 80 W limp-mode state and into the laptop's high-performance GPU power state.
+The project enables the laptop's OEM firmware performance path; it does not
+overclock the GPU. The default AI cooling profile has been exercised under
+long-running inference workloads and remains fully configurable.
 
-This does not overclock the GPU. It enables the OEM firmware performance state that the laptop already exposes, but does not enable correctly on Linux for this hardware.
+## Safety and supported hardware
 
-On the creator's test workload, this reduced a specific AI inference workload from about 12.5 seconds to about 8 seconds. That performance increase also raised GPU thermals by roughly 25 C.
+This software changes firmware-controlled GPU power and cooling behavior.
+Higher performance means substantially more heat, power draw, fan noise, and
+hardware stress. Monitor temperatures and keep intake and exhaust paths clear.
 
-## Use At Your Own Risk
+Validated platform:
 
-This tool intentionally changes firmware-controlled GPU power behavior. Use it only if you understand the extra heat, power draw, fan noise, and hardware stress involved.
+- HP OMEN MAX Gaming Laptop 16-ak0xxx
+- System board `8D87`
+- NVIDIA GeForce RTX 5080 Laptop GPU
+- BIOS `F.07`
+- Fedora Linux 44
+- Linux `7.1.5-201.fc44.x86_64`
 
-Proper cooling matters. Keep vents clear, monitor temperatures, and strongly consider using a cooling pad or other elevated airflow setup when running heavy GPU workloads.
+The kernel module refuses to load on other boards by default. Advanced users
+can set `force_unsupported=1`, but the fan commands and 175 W power request may
+be unsafe on untested hardware.
 
-Tested target hardware and software:
+The installer exposes that override explicitly:
 
-- RTX 5080 Laptop GPU
-- HP OMEN laptop
-- Fedora Linux running KDE Plasma
-- Recent Linux kernel with matching headers
-- Recent Nvidia Linux driver
-
-Unique board, BIOS, hostname, and local machine identifiers are intentionally omitted from this release documentation.
-
-## How It Works
-
-`omen_wmi_boost` uses HP's WMI firmware interface to run the same class of performance-state commands normally handled by OEM tooling:
-
-```text
-WMAA -> WHCM -> GMCF -> GC21/GC22
+```bash
+sudo ./install.sh --force-unsupported
 ```
 
-The important WMI GUID is:
+Do not use it merely to bypass an installation error.
 
-```text
-5FB7F034-2C63-45E9-BE91-3D44E2C707E4
-```
+## Features
 
-The module reads and writes firmware GPU power flags such as `CTGP`, `DTGP`, `DBST`, and the OMEN high-performance policy gate `OGHP`. See `docs/REVERSE-ENGINEERING.md` for more detail.
-
-## What It Installs
-
-The installer builds the module for the running kernel, loads it at boot, and installs a verifier service.
-
-- `/lib/modules/<kernel>/updates/omen_wmi_boost.ko`
-- `/etc/modules-load.d/omen_wmi_boost.conf`
-- `/etc/modprobe.d/omen_wmi_boost.conf`
-- `/etc/systemd/system/omen-wmi-boost-verify.service`
-- `/usr/local/sbin/omen-wmi-boost-verify`
-- `/usr/local/sbin/omen-wmi-boost-rebuild`
-- `/etc/kernel/install.d/zz-omen-wmi-boost.install`
-- `/usr/share/doc/omen-wmi-boost/BOOT-SETUP.md`
+- Enables HP WMI `CTGP` and `DTGP`/`ppab` performance flags.
+- Queues the tested firmware GPU power request for the 175 W limit.
+- Exposes automatic, manual, and maximum fan control through sysfs.
+- Uses a configurable piecewise-linear temperature/fan curve.
+- Adds workload-duration heat-soak bias for sustained AI workloads.
+- Returns fan control to firmware when the GPU becomes idle.
+- Warns at high temperature and disables the unlock at a configurable critical
+  threshold.
+- Rebuilds the out-of-tree module after Fedora kernel updates and repairs a
+  missing module at the next verification boot.
 
 ## Requirements
 
-Install the build tools and matching kernel headers first:
+Install Fedora build dependencies for the running kernel:
 
 ```bash
-sudo dnf install gcc make kernel-devel-$(uname -r)
+sudo dnf install gcc make python3 kernel-devel-$(uname -r)
 ```
 
-Secure Boot must either be disabled or configured to trust/sign the module. Unsigned out-of-tree modules will not load with Secure Boot enforcement.
-
-Future Linux, kernel, Nvidia driver, or BIOS updates may break compatibility.
+The NVIDIA driver and `nvidia-smi` must work. Secure Boot must be disabled or
+configured to trust a signed copy of this module.
 
 ## Install
 
-Inspect the current system without making changes:
+Inspect the intended changes:
 
 ```bash
-cd ~/5080_Unlock
 ./install.sh --dry-run
 ```
 
+Build, install, and start the services:
+
 ```bash
-cd ~/5080_Unlock
 sudo ./install.sh
 ```
 
-The installer performs a smoke test, but it does not reboot automatically. Reboot when ready:
+A reboot is recommended to validate boot persistence:
 
 ```bash
 sudo reboot
 ```
 
-After reboot:
+Verify:
 
 ```bash
 cat /sys/kernel/omen_wmi_boost/gpu_state
+cat /sys/kernel/omen_wmi_boost/fan_state
 systemctl status omen-wmi-boost-verify.service
-nvidia-smi -q -d POWER
+systemctl status omen-wmi-fan-control.service
 ```
 
-Expected `gpu_state` includes:
+Expected GPU state includes `ctgp=1 ppab=1`.
+
+## Default AI cooling policy
+
+The controller polls every four seconds and enters manual cooling when GPU
+utilization exceeds 5%, graphics clock reaches 500 MHz, or temperature reaches
+45 C. The shipped curve is:
+
+```ini
+fan_curve=32:5,45:50,70:50,76:70,82:100
+target_temp_c=70
+```
+
+Each pair is `temperature-C:fan-percent`. Values between points are linearly
+interpolated. The active fan floor is 50%. Long AI workloads accumulate a
+gradual 5% heat-soak bias every two minutes while at or above the 70 C target,
+up to 25%.
+
+When the workload ends, short jobs receive a proportional cooldown hold. Once
+the GPU is cool and idle, control returns to firmware `auto`.
+
+## Configure fan and thermal policy
+
+Edit:
 
 ```text
-ctgp=1 ppab=1
+/etc/omen-wmi-fan-control.conf
+```
+
+Then validate without changing hardware and restart:
+
+```bash
+sudo /usr/local/sbin/omen-wmi-fan-control --dry-run --once
+sudo systemctl restart omen-wmi-fan-control.service
+```
+
+Common curve shapes:
+
+```ini
+# Linear
+fan_curve=35:20,50:40,65:60,75:80,82:100
+
+# Balanced
+fan_curve=32:10,45:40,68:55,76:75,82:100
+
+# Sharp upper-end climb
+fan_curve=32:10,65:45,74:55,78:80,82:100
+```
+
+The AI profile remains the default. `active_fan_floor` can override low curve
+points while a workload is active.
+
+Upgrade installs preserve the active config and place current defaults at:
+
+```text
+/etc/omen-wmi-fan-control.conf.example
+```
+
+## Thermal protection
+
+Default safety settings:
+
+```ini
+warning_temp_c=80
+warning_fan_percent=90
+unlock_disable_temp_c=85
+critical_samples=2
+warning_repeat_s=300
+```
+
+At the warning threshold the controller raises cooling and sends a rate-limited
+journal and desktop warning. Check for dirty fans, blocked vents, poor airflow,
+or a workload that exceeds the cooling system. Elevating the rear or using a
+capable cooling pad may help.
+
+Two consecutive critical readings cause the controller to:
+
+1. Request maximum fan cooling.
+2. Disable the GPU unlock.
+3. Write `/run/omen_wmi_boost.thermal`.
+4. Keep thermal protection latched and notify logged-in users.
+
+Stop the workload and let the system cool. Inspect and clean the fans and vents
+before restoring normal operation. Once temperatures are safe:
+
+```bash
+sudo systemctl restart omen-wmi-fan-control.service
+echo 1 | sudo tee /sys/kernel/omen_wmi_boost/performance
+```
+
+Critical shutdown always overrides custom fan preferences. If telemetry or fan
+writes fail near a thermal limit, the controller disables boost and falls back
+to firmware automatic fan control.
+
+## Troubleshooting
+
+```bash
+journalctl -t omen-wmi-boost -b
+journalctl -u omen-wmi-fan-control.service -b
+cat /sys/kernel/omen_wmi_boost/last_error
+cat /sys/kernel/omen_wmi_boost/fan_state
+nvidia-smi
+```
+
+After a kernel update, install matching `kernel-devel` if the module could not
+be rebuilt, then restart verification:
+
+```bash
+sudo systemctl restart omen-wmi-boost-verify.service
 ```
 
 ## Uninstall
 
-The uninstaller actively disables the WMI GPU boost flags before removing persistence, returning the machine to the previous limp-mode behavior.
+The uninstaller disables boost, removes installed modules and services, and
+preserves the user-edited fan config:
 
 ```bash
-cd ~/5080_Unlock
 sudo ./install.sh --uninstall
 ```
 
-It leaves the source tree in place under `/usr/src/omen_wmi_boost` and this checkout untouched.
+## Development and testing
 
-## Manual Controls
-
-Re-apply performance mode without reboot:
+Non-destructive checks:
 
 ```bash
-echo 1 | sudo tee /sys/kernel/omen_wmi_boost/performance
+./run-tests.sh
 ```
 
-Disable boost while the module is loaded:
+Explicit privileged hardware integration test:
 
 ```bash
-echo 0 | sudo tee /sys/kernel/omen_wmi_boost/boost
+sudo ./run-tests.sh --hardware
 ```
 
-Reload the module manually:
-
-```bash
-sudo modprobe -r omen_wmi_boost
-sudo modprobe omen_wmi_boost
-```
-
-## Troubleshooting
-
-Check the verifier journal:
-
-```bash
-journalctl -t omen-wmi-boost -b
-```
-
-Check module state:
-
-```bash
-lsmod | grep omen_wmi_boost
-cat /sys/kernel/omen_wmi_boost/gpu_state
-cat /sys/kernel/omen_wmi_boost/last_error
-```
-
-Check Nvidia power policy:
-
-```bash
-journalctl -u nvidia-powerd -b
-nvidia-smi -q -d POWER
-```
-
-If WMI state is enabled but power is still capped, check `journalctl -u nvidia-powerd -b` and confirm the laptop is on AC power with adequate cooling.
-
-## Maintenance
-
-The creator intends to maintain this program only for compatibility fixes, such as Linux, Fedora, kernel, Nvidia driver, or HP firmware updates that break the current behavior. New features, broader hardware support, and general tuning are not guaranteed.
+See `docs/BOOT-SETUP.md`, `docs/FAN-CONTROL.md`,
+`docs/FIRMWARE-CONTROLS.md`, and `docs/REVERSE-ENGINEERING.md` for operational
+and firmware details.
 
 ## License
 
-MIT. See `LICENSE`.
-
-## Development
-
-Build manually:
-
-```bash
-make -C omen_wmi_boost
-```
-
-Clean generated module output:
-
-```bash
-make -C omen_wmi_boost clean
-```
-
-Run the quick validation script:
-
-```bash
-sudo ./run-tests.sh
-```
-
-The repository ignores generated kernel build artifacts such as `*.ko`, `*.o`, `*.mod.c`, `Module.symvers`, and `modules.order`.
-
-## How this started
-
-*A candid story — not part of the technical release itself.*
-
-I had just finished setting up RAID0 and was benchmarking the machine ahead of AI workloads, keeping an eye on thermals. I asked ChatGPT whether the cooling looked sane; it replied that either the cooling was datacenter-grade or the GPU was being throttled. That sent me down the rabbit hole, where I found the GPU stuck in so-called **limp mode** — capped around 80 W while the VBIOS advertised far more. I did not care for that.
-
-Somewhere in there I said I wanted to feel the heat of a thousand suns under my palm, and I'd be damned if anything but the laws of thermodynamics stopped me. ChatGPT and I worked through what the kernel and firmware were actually doing. This little program is what came out of that.
+The kernel module is GPL-2.0-only. Userspace scripts, configuration,
+documentation, and other project material are MIT licensed. See `LICENSE` and
+`LICENSES/GPL-2.0-only.txt`.

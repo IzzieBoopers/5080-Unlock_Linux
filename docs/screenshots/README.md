@@ -1,5 +1,3 @@
-# Screenshots
-
 # HP OMEN RTX 5080 Linux Dynamic Boost Unlock
 
 ## Performance Validation
@@ -159,10 +157,11 @@ This project was tested specifically on:
 
 ```text
 HP OMEN MAX 16-ak0xxx
+Board 8D87
 RTX 5080 Laptop GPU
-BIOS F.05
+BIOS F.07
 Fedora 44
-Kernel 7.0.x
+Kernel 7.1.5-201.fc44.x86_64
 ```
 
 Behavior on other HP systems is not guaranteed.

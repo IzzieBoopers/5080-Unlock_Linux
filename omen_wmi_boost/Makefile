@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-2.0-only
 obj-m += omen_wmi_boost.o
 
 KDIR ?= /lib/modules/$(shell uname -r)/build

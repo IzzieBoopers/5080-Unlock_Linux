@@ -1,16 +1,12 @@
 [Unit]
 Description=Verify HP OMEN GPU power boost (omen_wmi_boost)
 Documentation=file:/usr/share/doc/omen-wmi-boost/BOOT-SETUP.md
-After=systemd-modules-load.service sysinit.target
-Before=graphical.target
-DefaultDependencies=no
+After=systemd-modules-load.service nvidia-powerd.service
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=/usr/local/sbin/omen-wmi-boost-verify
-# Loud failure: unit shows failed in systemctl / KDE status
-SuccessExitStatus=
 
 [Install]
 WantedBy=multi-user.target

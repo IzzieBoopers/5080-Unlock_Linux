@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    container: fedora:44
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install validation dependencies
+        run: dnf install -y gcc make kernel-devel python3 ShellCheck systemd git
+
+      - name: Check repository whitespace
+        run: git diff --check "$(git hash-object -t tree /dev/null)" HEAD
+
+      - name: Check shell scripts
+        run: |
+          bash -n install.sh run-tests.sh kernel/install.d/zz-omen-wmi-boost.install scripts/omen-wmi-boost-rebuild scripts/omen-wmi-boost-verify scripts/omen-wmi-notify
+          shellcheck install.sh run-tests.sh kernel/install.d/zz-omen-wmi-boost.install scripts/omen-wmi-boost-rebuild scripts/omen-wmi-boost-verify scripts/omen-wmi-notify
+
+      - name: Run fan policy tests
+        run: python3 -m unittest discover -s tests -v
+
+      - name: Verify systemd units
+        run: |
+          install -m 755 scripts/omen-wmi-* /usr/local/sbin/
+          systemd-analyze verify systemd/omen-wmi-boost-verify.service systemd/omen-wmi-fan-control.service
+
+      - name: Build kernel module
+        run: |
+          kdir=$(find /usr/src/kernels -mindepth 1 -maxdepth 1 -type d -print -quit)
+          test -n "$kdir"
+          make -C omen_wmi_boost KDIR="$kdir"
