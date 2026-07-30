@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: MIT
 # Rebuild omen_wmi_boost when a new kernel is installed (Fedora kernel-install.d).
 set -eu
 
