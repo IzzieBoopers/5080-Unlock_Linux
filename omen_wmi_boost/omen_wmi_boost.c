@@ -5,6 +5,7 @@
  */
 
 #include <linux/acpi.h>
+#include <linux/delay.h>
 #include <linux/dmi.h>
 #include <linux/init.h>
 #include <linux/kernel.h>
@@ -40,6 +41,12 @@
 #define HP_FAN_GPU			1
 #define HP_FAN_KEEPALIVE_SECS		90
 #define HP_FAN_DEFAULT_MAX_SPEED	60
+
+#define HP_GPU_ATIF_AFNC_PATH		"\\_SB.PCI0.GPPA.VGA.AFNC"
+#define HP_GPU_ATIF_DEFAULT_TARGET	0
+#define HP_GPU_ATIF_DEFAULT_RAW_LIMIT	0x0000015e
+#define OMEN_SUPPORTED_BOARD_NAME	"8D87"
+#define OMEN_SUPPORTED_PRODUCT_NAME	"OMEN MAX Gaming Laptop 16-ak0xxx"
 
 #define HPWMI_RET_UNKNOWN_COMMAND	0x03
 #define HPWMI_RET_UNKNOWN_CMDTYPE	0x04
@@ -107,6 +114,11 @@ static bool persist = true;
 module_param(persist, bool, 0444);
 MODULE_PARM_DESC(persist, "Stay loaded and expose sysfs (default: Y)");
 
+static bool force_unsupported;
+module_param(force_unsupported, bool, 0444);
+MODULE_PARM_DESC(force_unsupported,
+		 "Allow loading on an unvalidated board (unsafe; default: N)");
+
 static bool auto_boost;
 module_param(auto_boost, bool, 0444);
 MODULE_PARM_DESC(auto_boost, "On load, run full performance path (persist mode)");
@@ -118,6 +130,19 @@ MODULE_PARM_DESC(minimal_packet, "Prefer DASI=0 for GC21 reads");
 static u8 thermal_profile = HP_THERMAL_VICTUS_S_PERFORMANCE;
 module_param(thermal_profile, byte, 0644);
 MODULE_PARM_DESC(thermal_profile, "SET_PERFORMANCE_MODE byte (1 or 0x31)");
+
+static bool gpu_power_request = true;
+module_param(gpu_power_request, bool, 0644);
+MODULE_PARM_DESC(gpu_power_request,
+		 "Request firmware GPU power limit during performance apply");
+
+static uint gpu_power_target = HP_GPU_ATIF_DEFAULT_TARGET;
+module_param(gpu_power_target, uint, 0644);
+MODULE_PARM_DESC(gpu_power_target, "AFNC target graphics controller index");
+
+static uint gpu_power_raw = HP_GPU_ATIF_DEFAULT_RAW_LIMIT;
+module_param(gpu_power_raw, uint, 0644);
+MODULE_PARM_DESC(gpu_power_raw, "AFNC raw GPU power request value");
 
 static char boot_mode[16];
 module_param_string(boot_mode, boot_mode, sizeof(boot_mode), 0444);
@@ -554,7 +579,19 @@ static void fan_control_init(void)
 
 static void fan_control_exit(void)
 {
+	int ret;
+
 	cancel_delayed_work_sync(&omen_drv.fan.keepalive);
+
+	guard(mutex)(&omen_drv.lock);
+	if (omen_drv.fan.mode == FAN_MODE_AUTO)
+		return;
+
+	omen_drv.fan.mode = FAN_MODE_AUTO;
+	ret = fan_apply_locked();
+	if (ret)
+		pr_warn("failed to restore firmware automatic fan control: %d\n",
+			ret);
 }
 
 static int thermal_profile_set(u8 profile)
@@ -564,30 +601,77 @@ static int thermal_profile_set(u8 profile)
 	return hp_gm_query(HPWMI_SET_PERFORMANCE_MODE, buf, sizeof(buf), 0);
 }
 
+static int gpu_power_limit_request(void)
+{
+	union acpi_object args[2];
+	struct acpi_object_list arg_list = {
+		.count = ARRAY_SIZE(args),
+		.pointer = args,
+	};
+	acpi_handle handle;
+	acpi_status ast;
+
+	if (!gpu_power_request)
+		return 0;
+
+	if (gpu_power_target > U8_MAX)
+		return -EINVAL;
+
+	ast = acpi_get_handle(NULL, HP_GPU_ATIF_AFNC_PATH, &handle);
+	if (ACPI_FAILURE(ast)) {
+		pr_warn("ACPI handle %s not found: %s\n", HP_GPU_ATIF_AFNC_PATH,
+			acpi_format_exception(ast));
+		return -ENODEV;
+	}
+
+	args[0].type = ACPI_TYPE_INTEGER;
+	args[0].integer.value = gpu_power_target;
+	args[1].type = ACPI_TYPE_INTEGER;
+	args[1].integer.value = gpu_power_raw;
+
+	ast = acpi_evaluate_object(handle, NULL, &arg_list, NULL);
+	if (ACPI_FAILURE(ast)) {
+		pr_warn("AFNC target=%u raw=0x%x failed: %s\n",
+			gpu_power_target, gpu_power_raw, acpi_format_exception(ast));
+		return -EIO;
+	}
+
+	pr_info("AFNC target=%u raw=0x%x queued\n",
+		gpu_power_target, gpu_power_raw);
+	return 0;
+}
+
 static int gpu_boost_set(bool enable)
 {
 	struct gpu_power_modes before, after;
-	int ret;
+	int ret, attempt;
 
-	ret = gpu_modes_read(&before);
-	if (ret)
-		return ret;
+	for (attempt = 0; attempt < 5; attempt++) {
+		ret = gpu_modes_read(&before);
+		if (ret)
+			return ret;
 
-	gpu_modes_log(enable ? "enabling" : "disabling", &before);
+		if (attempt == 0)
+			gpu_modes_log(enable ? "enabling" : "disabling", &before);
 
-	ret = gpu_modes_write(enable, &before);
-	if (ret)
-		return ret;
+		ret = gpu_modes_write(enable, &before);
+		if (ret)
+			return ret;
 
-	ret = gpu_modes_read(&after);
-	if (ret)
-		return ret;
+		ret = gpu_modes_read(&after);
+		if (ret)
+			return ret;
 
-	gpu_modes_log("result", &after);
+		gpu_modes_log("result", &after);
 
-	if (enable && (!after.ctgp || !after.ppab))
-		pr_warn("CTGP/DTGP did not stick — check OGHP / thermal profile\n");
+		if (!enable || (after.ctgp && after.ppab))
+			return 0;
 
+		pr_warn("CTGP/DTGP did not stick (attempt %d/5)\n", attempt + 1);
+		msleep(500);
+	}
+
+	pr_warn("CTGP/DTGP did not stick after retries — check OGHP / thermal profile\n");
 	return 0;
 }
 
@@ -607,7 +691,16 @@ static int performance_apply(void)
 	}
 
 	pr_info("thermal profile 0x%02x set\n", thermal_profile);
-	return gpu_boost_set(true);
+
+	ret = gpu_boost_set(true);
+	if (ret)
+		return ret;
+
+	ret = gpu_power_limit_request();
+	if (ret)
+		pr_warn("GPU power-limit request failed (%d), continuing\n", ret);
+
+	return 0;
 }
 
 static int trace_dump(void)
@@ -979,11 +1072,26 @@ static int omen_sysfs_init(void)
 static int __init omen_wmi_boost_init(void)
 {
 	const char *once;
+	const char *board;
+	const char *product;
 	int ret = 0;
 
 	if (!wmi_has_guid(HPWMI_BIOS_GUID)) {
 		pr_err("HP BIOS WMI GUID not present\n");
 		return -ENODEV;
+	}
+
+	board = dmi_get_system_info(DMI_BOARD_NAME);
+	product = dmi_get_system_info(DMI_PRODUCT_NAME);
+	if (!board || strcmp(board, OMEN_SUPPORTED_BOARD_NAME) ||
+	    !product || strcmp(product, OMEN_SUPPORTED_PRODUCT_NAME)) {
+		if (!force_unsupported) {
+			pr_err("platform board=%s product=%s is not validated; refusing to load (use force_unsupported=1 at your own risk)\n",
+			       board ?: "unknown", product ?: "unknown");
+			return -ENODEV;
+		}
+		pr_warn("UNSAFE override: board=%s product=%s is not validated for these GPU/fan commands\n",
+			board ?: "unknown", product ?: "unknown");
 	}
 
 	omen_drv.wmi_ready = true;
@@ -1041,7 +1149,7 @@ module_init(omen_wmi_boost_init);
 module_exit(omen_wmi_boost_exit);
 
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("HP OMEN WMI GPU power unlock");
+MODULE_DESCRIPTION("HP OMEN WMI GPU power unlock and fan control");
 MODULE_AUTHOR("5080_Unlock");
-MODULE_VERSION("1.2");
+MODULE_VERSION("2.0.0");
 MODULE_SOFTDEP("pre: wmi");

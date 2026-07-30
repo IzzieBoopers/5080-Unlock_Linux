@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
 """GPU-aware fan controller for omen_wmi_boost."""
 
 from __future__ import annotations
@@ -8,21 +9,44 @@ import signal
 import subprocess
 import sys
 import time
+from dataclasses import dataclass, fields, replace
 from pathlib import Path
 
 
 DEFAULT_SYSFS = Path("/sys/kernel/omen_wmi_boost")
+DEFAULT_CONFIG = Path("/etc/omen-wmi-fan-control.conf")
+DEFAULT_NOTIFIER = "/usr/local/sbin/omen-wmi-notify"
+THERMAL_STATE = Path("/run/omen_wmi_boost.thermal")
 DEFAULT_INTERVAL = 4
 DEFAULT_IDLE_HOLD = 180
+ACTIVE_HOLD_MULTIPLIER = 3
 ACTIVE_TEMP_C = 45
 IDLE_TEMP_C = 35
 CURVE_MIN_TEMP_C = 32
-CURVE_MAX_TEMP_C = 80
+TARGET_TEMP_C = 70
+CRITICAL_TEMP_C = 82
 CURVE_MIN_FAN_PERCENT = 5
 CURVE_MAX_FAN_PERCENT = 100
 ACTIVE_UTIL_PERCENT = 5
 ACTIVE_CLOCK_MHZ = 500
-ACTIVE_FAN_FLOOR = 40
+WORKLOAD_UTIL_PERCENT = 30
+WORKLOAD_POWER_W = 45
+WORKLOAD_CLOCK_MHZ = 1000
+ACTIVE_FAN_FLOOR = 50
+SOAK_AFTER_S = 120
+SOAK_STEP_S = 120
+SOAK_STEP_PERCENT = 5
+SOAK_MAX_BIAS_PERCENT = 25
+SOAK_GAP_HOLD_S = 90
+SOAK_DECAY_S = 600
+FAILSAFE_TEMP_C = 85
+FAILSAFE_RISE_C = 1
+FAN_CURVE = ((32, 5), (45, 50), (70, 50), (76, 70), (82, 100))
+WARNING_TEMP_C = 80
+WARNING_FAN_PERCENT = 90
+UNLOCK_DISABLE_TEMP_C = 85
+CRITICAL_SAMPLES = 2
+WARNING_REPEAT_S = 300
 RAMP_UP_STEP = 20
 RAMP_DOWN_STEP = 5
 
@@ -31,17 +55,211 @@ class FanControlError(RuntimeError):
     pass
 
 
+@dataclass(frozen=True)
+class FanSettings:
+    fan_curve: tuple[tuple[int, int], ...] = FAN_CURVE
+    active_temp_c: int = ACTIVE_TEMP_C
+    idle_temp_c: int = IDLE_TEMP_C
+    curve_min_temp_c: int = CURVE_MIN_TEMP_C
+    target_temp_c: int = TARGET_TEMP_C
+    critical_temp_c: int = CRITICAL_TEMP_C
+    curve_min_fan_percent: int = CURVE_MIN_FAN_PERCENT
+    curve_max_fan_percent: int = CURVE_MAX_FAN_PERCENT
+    active_util_percent: int = ACTIVE_UTIL_PERCENT
+    active_clock_mhz: int = ACTIVE_CLOCK_MHZ
+    workload_util_percent: int = WORKLOAD_UTIL_PERCENT
+    workload_power_w: int = WORKLOAD_POWER_W
+    workload_clock_mhz: int = WORKLOAD_CLOCK_MHZ
+    active_fan_floor: int = ACTIVE_FAN_FLOOR
+    soak_after_s: int = SOAK_AFTER_S
+    soak_step_s: int = SOAK_STEP_S
+    soak_step_percent: int = SOAK_STEP_PERCENT
+    soak_max_bias_percent: int = SOAK_MAX_BIAS_PERCENT
+    soak_gap_hold_s: int = SOAK_GAP_HOLD_S
+    soak_decay_s: int = SOAK_DECAY_S
+    # Deprecated input aliases retained for personal-build upgrades.
+    failsafe_temp_c: int = FAILSAFE_TEMP_C
+    failsafe_rise_c: int = FAILSAFE_RISE_C
+    warning_temp_c: int = WARNING_TEMP_C
+    warning_fan_percent: int = WARNING_FAN_PERCENT
+    unlock_disable_temp_c: int = UNLOCK_DISABLE_TEMP_C
+    critical_samples: int = CRITICAL_SAMPLES
+    warning_repeat_s: int = WARNING_REPEAT_S
+    ramp_up_step: int = RAMP_UP_STEP
+    ramp_down_step: int = RAMP_DOWN_STEP
+    active_hold_multiplier: int = ACTIVE_HOLD_MULTIPLIER
+
+
+def parse_config(path: Path) -> FanSettings:
+    settings = FanSettings()
+    if not path.exists():
+        return settings
+
+    values = {
+        field.name: getattr(settings, field.name)
+        for field in fields(settings)
+        if field.name != "fan_curve"
+    }
+    curve: tuple[tuple[int, int], ...] | None = None
+    seen_keys: set[str] = set()
+
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise FanControlError(f"cannot read config {path}: {exc}") from exc
+
+    for line_no, raw_line in enumerate(lines, start=1):
+        line = raw_line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        if "=" not in line:
+            raise FanControlError(f"{path}:{line_no}: expected key=value")
+        key, raw_value = [part.strip() for part in line.split("=", 1)]
+        if key in seen_keys:
+            raise FanControlError(f"{path}:{line_no}: duplicate setting {key!r}")
+        seen_keys.add(key)
+        if key == "fan_curve":
+            curve = parse_fan_curve(raw_value, path, line_no)
+            continue
+        if key not in values:
+            raise FanControlError(f"{path}:{line_no}: unknown setting {key!r}")
+        try:
+            values[key] = int(raw_value, 0)
+        except ValueError as exc:
+            raise FanControlError(f"{path}:{line_no}: {key} must be an integer") from exc
+
+    parsed = FanSettings(**values)
+    if curve is not None:
+        parsed = replace(parsed, fan_curve=curve)
+    elif any(
+        key in seen_keys
+        for key in (
+            "curve_min_temp_c",
+            "curve_min_fan_percent",
+            "active_temp_c",
+            "active_fan_floor",
+            "target_temp_c",
+            "critical_temp_c",
+            "curve_max_fan_percent",
+        )
+    ):
+        parsed = replace(
+            parsed,
+            fan_curve=(
+                (parsed.curve_min_temp_c, parsed.curve_min_fan_percent),
+                (parsed.active_temp_c, parsed.active_fan_floor),
+                (parsed.target_temp_c, parsed.active_fan_floor),
+                (parsed.critical_temp_c, parsed.curve_max_fan_percent),
+            ),
+        )
+    if "failsafe_temp_c" in seen_keys and "unlock_disable_temp_c" not in seen_keys:
+        parsed = replace(parsed, unlock_disable_temp_c=parsed.failsafe_temp_c)
+    validate_settings(parsed, path)
+    return parsed
+
+
+def parse_fan_curve(
+    value: str, path: Path, line_no: int
+) -> tuple[tuple[int, int], ...]:
+    points: list[tuple[int, int]] = []
+    try:
+        for raw_point in value.split(","):
+            raw_temp, raw_percent = raw_point.strip().split(":", 1)
+            points.append((int(raw_temp, 0), int(raw_percent, 0)))
+    except (TypeError, ValueError) as exc:
+        raise FanControlError(
+            f"{path}:{line_no}: fan_curve must be temp:percent pairs"
+        ) from exc
+    return tuple(points)
+
+
+def validate_settings(settings: FanSettings, path: Path) -> None:
+    def require(condition: bool, message: str) -> None:
+        if not condition:
+            raise FanControlError(f"{path}: {message}")
+
+    require(0 <= settings.active_fan_floor <= 100, "active_fan_floor must be 0..100")
+    require(settings.idle_temp_c < settings.active_temp_c, "idle_temp_c must be < active_temp_c")
+    require(settings.active_util_percent >= 0, "active_util_percent must be >= 0")
+    require(settings.active_clock_mhz >= 0, "active_clock_mhz must be >= 0")
+    require(settings.workload_util_percent >= 0, "workload_util_percent must be >= 0")
+    require(settings.workload_power_w >= 0, "workload_power_w must be >= 0")
+    require(settings.workload_clock_mhz >= 0, "workload_clock_mhz must be >= 0")
+    require(settings.soak_after_s >= 0, "soak_after_s must be >= 0")
+    require(settings.soak_step_s > 0, "soak_step_s must be > 0")
+    require(settings.soak_step_percent >= 0, "soak_step_percent must be >= 0")
+    require(0 <= settings.soak_max_bias_percent <= 100, "soak_max_bias_percent must be 0..100")
+    require(settings.soak_gap_hold_s >= 0, "soak_gap_hold_s must be >= 0")
+    require(settings.soak_decay_s > 0, "soak_decay_s must be > 0")
+    require(len(settings.fan_curve) >= 2, "fan_curve must contain at least two points")
+    for index, (temp, percent) in enumerate(settings.fan_curve):
+        require(temp >= 0, "fan_curve temperatures must be >= 0")
+        require(0 <= percent <= 100, "fan_curve percentages must be 0..100")
+        if index:
+            previous_temp = settings.fan_curve[index - 1][0]
+            require(
+                temp > previous_temp,
+                "fan_curve temperatures must be strictly increasing",
+            )
+            previous_percent = settings.fan_curve[index - 1][1]
+            require(
+                percent >= previous_percent,
+                "fan_curve percentages must not decrease as temperature rises",
+            )
+    require(settings.warning_temp_c > 0, "warning_temp_c must be > 0")
+    require(
+        0 <= settings.warning_fan_percent <= 100,
+        "warning_fan_percent must be 0..100",
+    )
+    require(
+        settings.fan_curve[0][0] <= settings.target_temp_c <= settings.fan_curve[-1][0],
+        "target_temp_c must be within the fan_curve temperature range",
+    )
+    require(
+        settings.unlock_disable_temp_c > settings.warning_temp_c,
+        "unlock_disable_temp_c must be > warning_temp_c",
+    )
+    require(
+        settings.fan_curve[-1][0] <= settings.unlock_disable_temp_c,
+        "fan_curve must reach its final point by unlock_disable_temp_c",
+    )
+    require(settings.critical_samples > 0, "critical_samples must be > 0")
+    require(settings.warning_repeat_s > 0, "warning_repeat_s must be > 0")
+    require(settings.ramp_up_step > 0, "ramp_up_step must be > 0")
+    require(settings.ramp_down_step > 0, "ramp_down_step must be > 0")
+    require(settings.active_hold_multiplier >= 0, "active_hold_multiplier must be >= 0")
+
+
 class Controller:
     def __init__(self, args: argparse.Namespace) -> None:
         self.sysfs = args.sysfs
         self.nvidia_smi = args.nvidia_smi
         self.interval = args.interval
         self.idle_hold = args.idle_hold
+        if self.interval <= 0:
+            raise FanControlError("interval must be > 0")
+        if self.idle_hold < 0:
+            raise FanControlError("idle-hold must be >= 0")
+        self.config = args.config
+        self.settings = parse_config(self.config)
+        self.notifier = args.notifier
+        self.thermal_state = args.thermal_state
         self.dry_run = args.dry_run
         self.once = args.once
         self.current_percent: int | None = None
+        self.soak_score_s = 0.0
+        self.last_tick_at: float | None = None
+        self.last_workload_at: float | None = None
+        self.active_started_at: float | None = None
         self.last_busy_at: float | None = None
+        self.active_hold_s = 0.0
+        self.critical_count = 0
+        self.thermal_latched = False
+        self.boost_disabled = False
+        self.last_warning_at: float | None = None
+        self.last_temp: int | None = None
         self.running = True
+        self.log(f"loaded fan config: {self.config}")
 
     def log(self, message: str) -> None:
         print(message, file=sys.stderr, flush=True)
@@ -90,41 +308,6 @@ class Controller:
 
         return temp, util, power, clock
 
-    def read_gpu_pids(self) -> set[int]:
-        pids: set[int] = set()
-
-        compute = self.run_cmd(
-            [
-                self.nvidia_smi,
-                "--query-compute-apps=pid",
-                "--format=csv,noheader,nounits",
-            ],
-            check=False,
-        )
-        for line in compute.splitlines():
-            line = line.strip()
-            if not line or line.startswith("No running"):
-                continue
-            try:
-                pids.add(int(line.split(",", 1)[0].strip()))
-            except ValueError:
-                continue
-
-        pmon = self.run_cmd([self.nvidia_smi, "pmon", "-c", "1"], check=False)
-        for line in pmon.splitlines():
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            fields = line.split()
-            if len(fields) < 2 or fields[1] == "-":
-                continue
-            try:
-                pids.add(int(fields[1]))
-            except ValueError:
-                continue
-
-        return pids
-
     def read_fan_state(self) -> dict[str, str]:
         path = self.sysfs / "fan_state"
         try:
@@ -152,25 +335,132 @@ class Controller:
     def set_auto(self) -> None:
         self.write_sysfs("fan_mode", "auto")
 
+    def disable_boost(self) -> None:
+        self.write_sysfs("boost", "0")
+
+    def notify(self, title: str, message: str, urgency: str = "critical") -> None:
+        self.log(f"notification: {title}: {message}")
+        if self.dry_run:
+            return
+        try:
+            self.run_cmd([self.notifier, title, message, urgency], check=False)
+        except FanControlError as exc:
+            self.log(f"desktop notification unavailable: {exc}")
+
+    def write_thermal_state(
+        self, temp: int, reason: str, boost_disabled: bool = True
+    ) -> None:
+        content = (
+            f"timestamp={time.time():.0f}\n"
+            f"temperature_c={temp}\n"
+            f"reason={reason}\n"
+            f"boost_disabled={int(boost_disabled)}\n"
+        )
+        if self.dry_run:
+            self.log(f"dry-run: write {self.thermal_state}")
+            return
+        try:
+            self.thermal_state.write_text(content, encoding="utf-8")
+        except OSError as exc:
+            self.log(f"cannot write thermal state {self.thermal_state}: {exc}")
+
     def fail_to_auto(self, reason: str) -> None:
+        if (
+            self.last_temp is not None
+            and self.last_temp >= self.settings.warning_temp_c
+        ):
+            self.log(
+                f"failure near thermal limit ({self.last_temp}C): {reason}; "
+                "disabling GPU boost"
+            )
+            try:
+                self.disable_boost()
+            except FanControlError as exc:
+                self.log(f"emergency GPU boost disable failed: {exc}")
         self.log(f"failure: {reason}; falling back to fan_mode=auto")
         self.set_auto()
 
-    def curve_percent(self, temp: int, active: bool) -> int:
-        if temp <= CURVE_MIN_TEMP_C:
-            fan = CURVE_MIN_FAN_PERCENT
-        elif temp >= CURVE_MAX_TEMP_C:
-            fan = CURVE_MAX_FAN_PERCENT
+    def curve_percent(self, temp: int, active: bool = True) -> int:
+        curve = self.settings.fan_curve
+        if temp <= curve[0][0]:
+            fan = curve[0][1]
+        elif temp >= curve[-1][0]:
+            fan = curve[-1][1]
         else:
-            temp_span = CURVE_MAX_TEMP_C - CURVE_MIN_TEMP_C
-            fan_span = CURVE_MAX_FAN_PERCENT - CURVE_MIN_FAN_PERCENT
-            fan = CURVE_MIN_FAN_PERCENT + (
-                (temp - CURVE_MIN_TEMP_C) * fan_span
-            ) // temp_span
+            fan = curve[-1][1]
+            for (low_temp, low_fan), (high_temp, high_fan) in zip(
+                curve, curve[1:]
+            ):
+                if temp <= high_temp:
+                    temp_span = high_temp - low_temp
+                    fan_span = high_fan - low_fan
+                    fan = low_fan + ((temp - low_temp) * fan_span) // temp_span
+                    break
 
         if active:
-            fan = max(fan, ACTIVE_FAN_FLOOR)
-        return max(CURVE_MIN_FAN_PERCENT, min(CURVE_MAX_FAN_PERCENT, fan))
+            fan = max(fan, self.settings.active_fan_floor)
+        return max(0, min(100, fan))
+
+    def target_percent(self, temp: int, active: bool, soak_bias: int) -> int:
+        target = self.curve_percent(temp, active=active) + soak_bias
+        if temp >= self.settings.warning_temp_c:
+            target = max(target, self.settings.warning_fan_percent)
+        return min(100, target)
+
+    def workload_busy(self, util: int, power: float, clock: int) -> bool:
+        settings = self.settings
+        return (
+            util >= settings.workload_util_percent
+            or power >= settings.workload_power_w
+            or clock >= settings.workload_clock_mhz
+        )
+
+    def max_soak_score_s(self) -> float:
+        settings = self.settings
+        if settings.soak_step_percent == 0 or settings.soak_max_bias_percent == 0:
+            return 0.0
+        steps = (
+            settings.soak_max_bias_percent + settings.soak_step_percent - 1
+        ) // settings.soak_step_percent
+        return float(settings.soak_after_s + max(0, steps - 1) * settings.soak_step_s)
+
+    def update_soak_score(self, workload_busy: bool, now: float) -> None:
+        settings = self.settings
+        if self.last_tick_at is None:
+            elapsed = float(self.interval)
+        else:
+            elapsed = max(0.0, now - self.last_tick_at)
+        self.last_tick_at = now
+
+        max_score = self.max_soak_score_s()
+        if max_score <= 0:
+            self.soak_score_s = 0.0
+            return
+
+        if workload_busy:
+            self.last_workload_at = now
+            self.soak_score_s = min(max_score, self.soak_score_s + elapsed)
+            return
+
+        if (
+            self.last_workload_at is not None
+            and now - self.last_workload_at <= settings.soak_gap_hold_s
+        ):
+            return
+
+        decay_per_second = max_score / settings.soak_decay_s
+        self.soak_score_s = max(0.0, self.soak_score_s - elapsed * decay_per_second)
+        if self.soak_score_s == 0:
+            self.last_workload_at = None
+
+    def soak_bias_percent(self) -> int:
+        settings = self.settings
+        if settings.soak_step_percent == 0 or self.soak_score_s < settings.soak_after_s:
+            return 0
+
+        steps = 1 + int((self.soak_score_s - settings.soak_after_s) // settings.soak_step_s)
+        bias = steps * settings.soak_step_percent
+        return min(settings.soak_max_bias_percent, bias)
 
     def rate_limit(self, target: int) -> int:
         if self.current_percent is None:
@@ -178,9 +468,9 @@ class Controller:
             return target
 
         if target > self.current_percent:
-            self.current_percent = min(target, self.current_percent + RAMP_UP_STEP)
+            self.current_percent = min(target, self.current_percent + self.settings.ramp_up_step)
         elif target < self.current_percent:
-            self.current_percent = max(target, self.current_percent - RAMP_DOWN_STEP)
+            self.current_percent = max(target, self.current_percent - self.settings.ramp_down_step)
 
         return self.current_percent
 
@@ -199,30 +489,119 @@ class Controller:
     def apply_manual(self, percent: int, state: dict[str, str]) -> None:
         if state.get("manual_supported") != "1":
             self.log("manual fan control unsupported; leaving firmware auto")
-            self.set_auto()
+            if state.get("mode") != "auto":
+                self.set_auto()
             return
 
         speed = self.percent_to_speed(percent, state)
-        self.write_sysfs("fan_mode", "manual")
-        self.write_sysfs("fan_speed", str(speed))
+        if state.get("mode") != "manual":
+            self.write_sysfs("fan_mode", "manual")
+        if state.get("mode") != "manual" or state.get("manual_speed") != str(speed):
+            self.write_sysfs("fan_speed", str(speed))
         self.log(f"active: fan={percent}% speed={speed}")
 
-    def should_be_active(
-        self, temp: int, util: int, clock: int, pid_count: int
-    ) -> bool:
+    def update_active_hold(self, now: float) -> None:
+        if self.active_started_at is None:
+            self.active_started_at = now
+
+        active_duration = max(float(self.interval), now - self.active_started_at)
+        requested_hold = active_duration * self.settings.active_hold_multiplier
+        self.active_hold_s = min(float(self.idle_hold), requested_hold)
+
+    def reset_active_hold(self) -> None:
+        self.active_started_at = None
+        self.last_busy_at = None
+        self.active_hold_s = 0.0
+
+    def update_critical_count(self, temp: int) -> bool:
+        if temp >= self.settings.unlock_disable_temp_c:
+            self.critical_count += 1
+        else:
+            self.critical_count = 0
+        return self.critical_count >= self.settings.critical_samples
+
+    def warning_due(self, now: float) -> bool:
+        return (
+            self.last_warning_at is None
+            or now - self.last_warning_at >= self.settings.warning_repeat_s
+        )
+
+    def emit_thermal_warning(self, temp: int, now: float) -> None:
+        if not self.warning_due(now):
+            return
+        self.last_warning_at = now
+        self.notify(
+            "GPU temperature warning",
+            (
+                f"GPU reached {temp}C. Check for blocked vents or dirty fans, "
+                "improve airflow or elevate the rear, and stop the workload if "
+                "temperature continues to rise."
+            ),
+            urgency="normal",
+        )
+
+    def trip_thermal_protection(self, temp: int, state: dict[str, str]) -> None:
+        self.log(
+            "critical thermal protection: "
+            f"temp={temp}C samples={self.critical_count} mode={state.get('mode')}; "
+            "requesting maximum cooling and disabling GPU boost"
+        )
+
+        fan_error: FanControlError | None = None
+        try:
+            if state.get("mode") != "max":
+                self.write_sysfs("fan_mode", "max")
+        except FanControlError as exc:
+            fan_error = exc
+            self.log(f"maximum fan request failed: {exc}")
+
+        try:
+            self.disable_boost()
+            self.boost_disabled = True
+        except FanControlError as exc:
+            self.log(f"GPU boost disable failed: {exc}")
+
+        if fan_error is not None:
+            try:
+                self.set_auto()
+            except FanControlError as exc:
+                self.log(f"firmware auto fallback also failed: {exc}")
+
+        self.write_thermal_state(
+            temp, "critical_temperature", boost_disabled=self.boost_disabled
+        )
+        disable_status = (
+            "The unlock has been disabled."
+            if self.boost_disabled
+            else "The unlock could not be confirmed disabled; stop the workload now."
+        )
+        self.notify(
+            "GPU unlock disabled for thermal safety",
+            (
+                f"GPU remained at or above {self.settings.unlock_disable_temp_c}C. "
+                f"{disable_status} Stop the workload, clean the fans "
+                "and vents, and improve cooling before manually re-enabling it."
+            ),
+        )
+        self.thermal_latched = True
+        self.current_percent = None
+        self.reset_active_hold()
+
+    def should_be_active(self, temp: int, util: int, clock: int) -> bool:
         now = time.monotonic()
         busy = (
-            util > ACTIVE_UTIL_PERCENT
-            or clock >= ACTIVE_CLOCK_MHZ
-            or temp >= ACTIVE_TEMP_C
+            util > self.settings.active_util_percent
+            or clock >= self.settings.active_clock_mhz
+            or temp >= self.settings.active_temp_c
         )
         idle = (
-            util <= ACTIVE_UTIL_PERCENT
-            and clock < ACTIVE_CLOCK_MHZ
-            and temp <= IDLE_TEMP_C
+            util <= self.settings.active_util_percent
+            and clock < self.settings.active_clock_mhz
+            and temp <= self.settings.idle_temp_c
         )
 
         if busy:
+            self.update_active_hold(now)
             self.last_busy_at = now
             return True
 
@@ -230,33 +609,64 @@ class Controller:
             return self.last_busy_at is not None
 
         if self.last_busy_at is None:
+            self.active_started_at = None
             return False
 
-        if now - self.last_busy_at < self.idle_hold:
+        if now - self.last_busy_at < self.active_hold_s:
             return True
 
-        self.last_busy_at = None
+        self.reset_active_hold()
         return False
 
     def tick(self) -> None:
         temp, util, power, clock = self.read_gpu()
-        pids = self.read_gpu_pids()
+        self.last_temp = temp
         state = self.read_fan_state()
+        now = time.monotonic()
 
-        active = self.should_be_active(temp, util, clock, len(pids))
+        if self.thermal_latched:
+            if state.get("mode") != "max":
+                self.write_sysfs("fan_mode", "max")
+            if not self.boost_disabled:
+                self.disable_boost()
+                self.boost_disabled = True
+            self.log(
+                "thermal protection latched: "
+                f"temp={temp}C util={util}% clock={clock}MHz power={power:.1f}W "
+                "fan_mode=max boost=disabled"
+            )
+            return
+
+        if self.update_critical_count(temp):
+            self.trip_thermal_protection(temp, state)
+            return
+
+        active = self.should_be_active(temp, util, clock)
+        workload_busy = self.workload_busy(util, power, clock)
+        self.update_soak_score(workload_busy, now)
+        soak_bias = (
+            self.soak_bias_percent()
+            if active and temp >= self.settings.target_temp_c
+            else 0
+        )
+        if temp >= self.settings.warning_temp_c:
+            self.emit_thermal_warning(temp, now)
         self.log(
             "telemetry: "
             f"temp={temp}C util={util}% clock={clock}MHz power={power:.1f}W "
-            f"pids={len(pids)} active={int(active)}"
+            f"active={int(active)} workload={int(workload_busy)} "
+            f"hold={self.active_hold_s:.0f}s soak={self.soak_score_s:.0f}s "
+            f"soak_bias={soak_bias}% critical_samples={self.critical_count}"
         )
 
         if active:
-            target = self.curve_percent(temp, active=True)
+            target = self.target_percent(temp, active=True, soak_bias=soak_bias)
             limited = self.rate_limit(target)
             self.apply_manual(limited, state)
         else:
             self.current_percent = None
-            self.set_auto()
+            if state.get("mode") != "auto":
+                self.set_auto()
             self.log("idle: fan_mode=auto")
 
     def loop(self) -> int:
@@ -279,15 +689,17 @@ class Controller:
                 return 0
             time.sleep(self.interval)
 
-        try:
-            self.set_auto()
-        except FanControlError as exc:
-            self.log(f"shutdown auto fallback failed: {exc}")
-            return 1
+        if not self.thermal_latched:
+            try:
+                self.set_auto()
+            except FanControlError as exc:
+                self.log(f"shutdown auto fallback failed: {exc}")
+                return 1
         return 0
 
     def stop(self, signum: int, frame: object) -> None:
-        self.log(f"received signal {signum}; restoring auto mode")
+        action = "keeping maximum cooling" if self.thermal_latched else "restoring auto mode"
+        self.log(f"received signal {signum}; {action}")
         self.running = False
 
 
@@ -296,7 +708,10 @@ def parse_args() -> argparse.Namespace:
         description="GPU-aware fan controller for omen_wmi_boost"
     )
     parser.add_argument("--sysfs", type=Path, default=DEFAULT_SYSFS)
+    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--nvidia-smi", default="nvidia-smi")
+    parser.add_argument("--notifier", default=DEFAULT_NOTIFIER)
+    parser.add_argument("--thermal-state", type=Path, default=THERMAL_STATE)
     parser.add_argument("--interval", type=int, default=DEFAULT_INTERVAL)
     parser.add_argument("--idle-hold", type=int, default=DEFAULT_IDLE_HOLD)
     parser.add_argument(
@@ -312,8 +727,30 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def fail_closed(args: argparse.Namespace, reason: str) -> None:
+    print(
+        f"omen-wmi-fan-control: invalid safety configuration: {reason}; "
+        "disabling boost and restoring firmware auto",
+        file=sys.stderr,
+    )
+    if args.dry_run:
+        return
+    for name, value in (("boost", "0"), ("fan_mode", "auto")):
+        path = args.sysfs / name
+        try:
+            path.write_text(f"{value}\n", encoding="utf-8")
+        except OSError as exc:
+            print(f"omen-wmi-fan-control: fallback write {path} failed: {exc}", file=sys.stderr)
+
+
 def main() -> int:
-    return Controller(parse_args()).loop()
+    args = parse_args()
+    try:
+        controller = Controller(args)
+    except FanControlError as exc:
+        fail_closed(args, str(exc))
+        return 1
+    return controller.loop()
 
 
 if __name__ == "__main__":

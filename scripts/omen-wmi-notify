@@ -1,0 +1,49 @@
+#!/usr/bin/bash
+# SPDX-License-Identifier: MIT
+# Best-effort desktop notification for active graphical login sessions.
+set -u
+
+TITLE="${1:-HP OMEN thermal warning}"
+BODY="${2:-Check system cooling and journal logs.}"
+URGENCY="${3:-critical}"
+
+if ! command -v notify-send >/dev/null || ! command -v loginctl >/dev/null; then
+	exit 0
+fi
+
+while read -r session _uid user _seat _tty; do
+	[[ -n "$session" && -n "$user" ]] || continue
+
+	session_type=$(loginctl show-session "$session" -p Type --value 2>/dev/null) ||
+		continue
+	active=$(loginctl show-session "$session" -p Active --value 2>/dev/null) ||
+		continue
+	[[ "$active" == "yes" ]] || continue
+	[[ "$session_type" == "wayland" || "$session_type" == "x11" ]] || continue
+
+	uid=$(id -u "$user" 2>/dev/null) || continue
+	runtime="/run/user/${uid}"
+	[[ -S "${runtime}/bus" ]] || continue
+
+	display=":0"
+	while read -r pid; do
+		[[ -n "$pid" ]] || continue
+		process_display=$(
+			tr '\0' '\n' <"/proc/${pid}/environ" 2>/dev/null |
+				awk -F= '$1 == "DISPLAY" { sub(/^[^=]*=/, ""); print; exit }'
+		)
+		if [[ -n "$process_display" ]]; then
+			display="$process_display"
+			break
+		fi
+	done < <(pgrep -u "$uid" plasmashell kwin_wayland kwin_x11 2>/dev/null)
+
+	runuser -u "$user" -- env \
+		DISPLAY="$display" \
+		XDG_RUNTIME_DIR="$runtime" \
+		DBUS_SESSION_BUS_ADDRESS="unix:path=${runtime}/bus" \
+		notify-send -u "$URGENCY" -a "HP OMEN Control" "$TITLE" "$BODY" \
+		2>/dev/null || true
+done < <(loginctl list-sessions --no-legend 2>/dev/null)
+
+exit 0
