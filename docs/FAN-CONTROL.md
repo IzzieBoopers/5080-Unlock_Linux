@@ -26,7 +26,9 @@ Temperatures must be strictly increasing. Fan percentages must be `0..100`.
 The daemon linearly interpolates between points and clamps outside the first
 and last points.
 
-`target_temp_c` controls when sustained-workload heat-soak bias is allowed:
+`target_temp_c` is the cruise point and the temperature at which
+sustained-workload heat-soak bias is **earned**. Once earned, soak stays
+applied through dips below the target until the soak score decays:
 
 ```ini
 target_temp_c=70
@@ -88,7 +90,10 @@ workload_power_w=45
 workload_clock_mhz=1000
 ```
 
-At or above `target_temp_c`, sustained workload adds fan bias:
+Soak bias is **earned** the first time temperature is at or above
+`target_temp_c` after the soak score has reached `soak_after_s`. It is **kept**
+through dips below the target (including single-tick craters) and cleared only
+when the soak score decays to zero or the GPU leaves active/manual mode.
 
 ```ini
 soak_after_s=120
@@ -102,6 +107,10 @@ soak_decay_s=600
 This waits 120 seconds, then adds 5 percentage points every 120 seconds up to
 25 points. Brief model-loading gaps retain the score for 90 seconds; true idle
 time decays it over 600 seconds.
+
+While `workload_busy` is true, the controller does not lower the fan command
+when temperature falls. A cool sample during a job means cooling is winning,
+not that the load went away.
 
 ## Thermal safety
 
@@ -125,16 +134,28 @@ Safety thresholds override fan-curve preferences. If fan control fails near a
 thermal limit, the daemon disables boost and attempts firmware automatic fan
 control.
 
-## Rate limiting
+## Rate limiting and downshift hold
 
 ```ini
 ramp_up_step=20
-ramp_down_step=5
+ramp_down_step=1
+ramp_down_dwell_s=12
+temp_ema_alpha_percent=50
 ```
 
-These values are maximum percentage-point changes per control tick. They smooth
-normal curve changes; critical protection bypasses the curve and requests
-firmware maximum cooling immediately.
+`ramp_up_step` and `ramp_down_step` are maximum percentage-point changes per
+control tick. Ramp-up stays fast for load spikes; ramp-down is one point per
+tick.
+
+After a temperature rise, fan speed is not reduced for `ramp_down_dwell_s`.
+Busy workloads skip downshifts entirely. `temp_ema_alpha_percent` lightly
+smooths the temperature used for curve lookup (0 disables). Safety paths do
+not wait on that filter:
+
+- At `warning_temp_c`, the warning fan floor is applied from the raw sample
+  immediately (no EMA lag, dwell, busy-hold, or rate limit).
+- Critical protection bypasses the curve and requests firmware maximum cooling
+  immediately.
 
 ## Upgrade behavior
 
@@ -146,5 +167,5 @@ always refreshed at:
 ```
 
 Legacy scalar curve keys and `failsafe_temp_c` remain accepted for existing
-personal-build configurations. New configurations should use `fan_curve`,
-`warning_temp_c`, and `unlock_disable_temp_c`.
+configurations. New configurations should use `fan_curve`, `warning_temp_c`,
+and `unlock_disable_temp_c`.

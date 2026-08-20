@@ -29,4 +29,6 @@ critical_samples=2
 warning_repeat_s=300
 
 ramp_up_step=20
-ramp_down_step=5
+ramp_down_step=1
+ramp_down_dwell_s=12
+temp_ema_alpha_percent=50

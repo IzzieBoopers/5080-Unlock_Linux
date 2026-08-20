@@ -48,6 +48,9 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(settings.fan_curve[0], (32, 5))
         self.assertEqual(settings.fan_curve[-1], (82, 100))
         self.assertEqual(settings.unlock_disable_temp_c, 85)
+        self.assertEqual(settings.ramp_down_step, 1)
+        self.assertEqual(settings.ramp_down_dwell_s, 12)
+        self.assertEqual(settings.temp_ema_alpha_percent, 50)
 
     def test_custom_curve_and_safety(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -117,12 +120,48 @@ class ConfigTests(unittest.TestCase):
             ):
                 fan_control.parse_config(path)
 
+    def test_rejects_invalid_ema_alpha(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "fan.conf"
+            path.write_text("temp_ema_alpha_percent=101\n", encoding="utf-8")
+            with self.assertRaisesRegex(
+                fan_control.FanControlError, "temp_ema_alpha_percent"
+            ):
+                fan_control.parse_config(path)
+
 
 class PolicyTests(unittest.TestCase):
     def setUp(self):
         self.tempdir = tempfile.TemporaryDirectory()
         self.addCleanup(self.tempdir.cleanup)
         self.controller = make_controller(Path(self.tempdir.name))
+
+    def _run_tick(
+        self,
+        temp: int,
+        util: int,
+        power: float,
+        clock: int,
+        now: float,
+        state: dict[str, str] | None = None,
+    ) -> int | None:
+        if state is None:
+            state = {
+                "manual_supported": "1",
+                "mode": "manual",
+                "manual_speed": "0",
+                "speed_min": "0",
+                "speed_max": "100",
+            }
+        with (
+            mock.patch.object(
+                self.controller, "read_gpu", return_value=(temp, util, power, clock)
+            ),
+            mock.patch.object(self.controller, "read_fan_state", return_value=state),
+            mock.patch.object(fan_control.time, "monotonic", return_value=now),
+        ):
+            self.controller.tick()
+        return self.controller.current_percent
 
     def test_piecewise_curve_interpolation_and_active_floor(self):
         self.assertEqual(self.controller.curve_percent(45), 50)
@@ -141,6 +180,9 @@ class PolicyTests(unittest.TestCase):
         self.assertFalse(self.controller.workload_busy(0, 5.0, 180))
 
     def test_rate_limit(self):
+        self.controller.settings = fan_control.replace(
+            self.controller.settings, ramp_up_step=20, ramp_down_step=5
+        )
         self.controller.current_percent = 40
         self.assertEqual(self.controller.rate_limit(100), 60)
         self.assertEqual(self.controller.rate_limit(20), 55)
@@ -197,6 +239,131 @@ class PolicyTests(unittest.TestCase):
 
         self.assertEqual(calls[:2], [("fan_mode", "max"), ("boost", "0")])
         self.assertTrue(self.controller.thermal_latched)
+
+    def test_soak_not_applied_until_earned_at_target(self):
+        self.controller.soak_score_s = 120
+        self.assertEqual(self.controller.soak_bias_percent(), 5)
+        self.controller.update_soak_earned(True, 69)
+        self.assertEqual(self.controller.applied_soak_bias(True), 0)
+        self.controller.update_soak_earned(True, 70)
+        self.assertEqual(self.controller.applied_soak_bias(True), 5)
+
+    def test_soak_ratchet_holds_through_dips_until_score_decays(self):
+        self.controller.soak_score_s = 120
+        self.controller.update_soak_earned(True, 70)
+        self.assertEqual(self.controller.applied_soak_bias(True), 5)
+        self.controller.update_soak_earned(True, 69)
+        self.assertEqual(self.controller.applied_soak_bias(True), 5)
+        self.controller.update_soak_earned(True, 59)
+        self.assertEqual(self.controller.applied_soak_bias(True), 5)
+        self.controller.soak_score_s = 0
+        self.controller.update_soak_earned(True, 59)
+        self.assertEqual(self.controller.applied_soak_bias(True), 0)
+        self.controller.soak_score_s = 120
+        self.controller.update_soak_earned(False, 70)
+        self.assertEqual(self.controller.applied_soak_bias(False), 0)
+
+    def test_ema_does_not_immediately_track_integer_chatter(self):
+        self.controller.settings = fan_control.replace(
+            self.controller.settings, temp_ema_alpha_percent=50
+        )
+        self.assertEqual(self.controller.update_filtered_temp(71), 71.0)
+        self.assertEqual(self.controller.update_filtered_temp(72), 71.5)
+        self.assertEqual(self.controller.update_filtered_temp(71), 71.25)
+
+    def test_busy_hold_ignores_temperature_crater(self):
+        self.controller.current_percent = 62
+        self.controller.last_temp_rise_at = 0
+        self.assertEqual(
+            self.controller.command_percent(50, True, now=100, emergency=False),
+            62,
+        )
+
+    def test_idle_downshift_waits_for_dwell_then_ramps_slowly(self):
+        self.controller.settings = fan_control.replace(
+            self.controller.settings, ramp_down_step=1, ramp_down_dwell_s=12
+        )
+        self.controller.current_percent = 56
+        self.controller.last_temp_rise_at = 0
+        self.assertEqual(
+            self.controller.command_percent(50, False, now=11, emergency=False),
+            56,
+        )
+        self.assertEqual(
+            self.controller.command_percent(50, False, now=12, emergency=False),
+            55,
+        )
+
+    def test_warning_bypasses_smoothing_and_applies_floor_immediately(self):
+        self.controller.current_percent = 50
+        self.controller.last_temp_rise_at = 100
+        self.assertEqual(
+            self.controller.command_percent(90, True, now=101, emergency=True),
+            90,
+        )
+        self.assertEqual(
+            self.controller.target_percent(70.0, True, 0, raw_temp=80),
+            90,
+        )
+
+    def test_hunting_sequence_holds_with_earned_soak(self):
+        self.controller.settings = fan_control.replace(
+            self.controller.settings, temp_ema_alpha_percent=0
+        )
+        self.controller.soak_score_s = 120
+        self.controller.update_soak_earned(True, 70)
+        commands = []
+        for temp in (70, 69, 70, 69):
+            bias = self.controller.applied_soak_bias(True)
+            self.controller.update_soak_earned(True, temp)
+            desired = self.controller.target_percent(temp, True, bias)
+            commands.append(
+                self.controller.command_percent(
+                    desired, True, now=100, emergency=False
+                )
+            )
+        self.assertEqual(commands, [55, 55, 55, 55])
+
+    def test_busy_crater_sequence_holds_fan_command(self):
+        self.controller.settings = fan_control.replace(
+            self.controller.settings, temp_ema_alpha_percent=0
+        )
+        self.controller.soak_score_s = 120
+        self.controller.update_soak_earned(True, 72)
+        bias = self.controller.applied_soak_bias(True)
+        start = self.controller.target_percent(72, True, bias)
+        self.controller.current_percent = start
+        crater = self.controller.target_percent(59, True, bias)
+        held = self.controller.command_percent(
+            crater, True, now=8, emergency=False
+        )
+        bounce = self.controller.target_percent(70, True, bias)
+        held_after_bounce = self.controller.command_percent(
+            bounce, True, now=12, emergency=False
+        )
+        self.assertGreater(start, crater)
+        self.assertEqual(held, start)
+        self.assertEqual(held_after_bounce, start)
+
+    def test_tick_holds_busy_crater(self):
+        self.controller.settings = fan_control.replace(
+            self.controller.settings, temp_ema_alpha_percent=0
+        )
+        self.controller.soak_score_s = 120
+        self.controller.last_tick_at = 0
+        self.controller.last_workload_at = 0
+        first = self._run_tick(72, 50, 100.0, 1500, 4)
+        crater = self._run_tick(59, 50, 100.0, 1500, 8)
+        bounce = self._run_tick(70, 50, 100.0, 1500, 12)
+        self.assertEqual(first, crater)
+        self.assertEqual(crater, bounce)
+        self.assertGreater(first, 50)
+
+    def test_tick_applies_warning_floor_immediately(self):
+        self.controller.current_percent = 50
+        self.controller.last_temp_rise_at = 1000
+        warning = self._run_tick(80, 50, 100.0, 1500, 1004)
+        self.assertEqual(warning, 90)
 
 
 if __name__ == "__main__":

@@ -15,16 +15,16 @@ hardware stress. Monitor temperatures and keep intake and exhaust paths clear.
 
 Validated platform:
 
-- HP OMEN MAX Gaming Laptop 16-ak0xxx
+- HP OMEN MAX Gaming Laptop 16-ak0xxx (AMD)
 - System board `8D87`
 - NVIDIA GeForce RTX 5080 Laptop GPU
 - BIOS `F.07`
 - Fedora Linux 44
-- Linux `7.1.5-201.fc44.x86_64`
 
-The kernel module refuses to load on other boards by default. Advanced users
-can set `force_unsupported=1`, but the fan commands and 175 W power request may
-be unsafe on untested hardware.
+Intel `8D87` configurations are not on the allowlist. The kernel module refuses
+to load on other boards by default. Advanced users can set
+`force_unsupported=1`, but the fan commands and 175 W power request may be
+unsafe on untested hardware.
 
 The installer exposes that override explicitly:
 
@@ -36,8 +36,9 @@ Do not use it merely to bypass an installation error.
 
 ## Features
 
-- Enables HP WMI `CTGP` and `DTGP`/`ppab` performance flags.
-- Queues the tested firmware GPU power request for the 175 W limit.
+- Enables HP WMI `CTGP` and `DTGP` performance flags.
+- Uses the EC user-define trigger (`0x10`) before those flag writes so the
+  175 W firmware limit can take effect.
 - Exposes automatic, manual, and maximum fan control through sysfs.
 - Uses a configurable piecewise-linear temperature/fan curve.
 - Adds workload-duration heat-soak bias for sustained AI workloads.
@@ -87,7 +88,7 @@ systemctl status omen-wmi-boost-verify.service
 systemctl status omen-wmi-fan-control.service
 ```
 
-Expected GPU state includes `ctgp=1 ppab=1`.
+Expected GPU state includes `ctgp=1 dtgp=1`.
 
 ## Default AI cooling policy
 
@@ -102,8 +103,10 @@ target_temp_c=70
 
 Each pair is `temperature-C:fan-percent`. Values between points are linearly
 interpolated. The active fan floor is 50%. Long AI workloads accumulate a
-gradual 5% heat-soak bias every two minutes while at or above the 70 C target,
-up to 25%.
+gradual 5% heat-soak bias every two minutes after first reaching the 70 C
+target, up to 25%. Once earned, that bias is kept through dips below 70 C
+until the soak score decays. Busy workloads do not lower fan speed when
+temperature craters.
 
 When the workload ends, short jobs receive a proportional cooldown hold. Once
 the GPU is cool and idle, control returns to firmware `auto`.
@@ -222,8 +225,8 @@ sudo ./run-tests.sh --hardware
 ```
 
 See `docs/BOOT-SETUP.md`, `docs/FAN-CONTROL.md`,
-`docs/FIRMWARE-CONTROLS.md`, and `docs/REVERSE-ENGINEERING.md` for operational
-and firmware details.
+`docs/FIRMWARE-CONTROLS.md`, `docs/REVERSE-ENGINEERING.md`, and
+`docs/screenshots/README.md` for operational, firmware, and validation details.
 
 ## License
 

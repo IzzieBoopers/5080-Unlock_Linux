@@ -2,9 +2,17 @@
 
 ## Performance Validation
 
-The screenshots below compare the default Linux firmware behavior against the unlocked HP/OMEN Dynamic Boost performance state on an HP OMEN MAX Gaming Laptop 16-ak0xxx with an RTX 5080 Laptop GPU.
+These tables compare default Linux firmware behavior against the unlocked
+HP/OMEN Dynamic Boost performance state on an HP OMEN MAX Gaming Laptop
+16-ak0xxx with an RTX 5080 Laptop GPU.
 
-The default Linux firmware state limited the GPU to roughly 80W sustained package power. After enabling the HP/OMEN firmware performance state through the WMI control path, the GPU sustained roughly 170–175W during AI inference workloads.
+Desktop captures are omitted so session identifiers are not published. The
+numbers below are the validation record.
+
+The default Linux firmware state limited the GPU to roughly 80W sustained
+package power. After enabling the HP/OMEN firmware performance state through
+the WMI control path, the GPU sustained roughly 170–175W during AI inference
+workloads.
 
 ---
 
@@ -20,9 +28,9 @@ The default Linux firmware state limited the GPU to roughly 80W sustained packag
 ## Software
 
 * Fedora Linux 44
-* NVIDIA Driver 595.71.05
-* CUDA 13.2
-* ComfyUI workload
+* NVIDIA driver 595.x
+* CUDA 13.x
+* ComfyUI inference workload
 
 ---
 
@@ -36,7 +44,7 @@ The default Linux firmware state limited the GPU to roughly 80W sustained packag
 | Inference Time      | ~16.5–17.0s         | ~10.9–11.1s                  | ~35–37% faster        |
 | Iteration Rate      | ~2.5 it/s           | ~3.8 it/s                    | ~52% higher           |
 | GPU Utilization     | ~100%               | ~95–100%                     | effectively unchanged |
-| VRAM Usage          | ~7.2 GB             | ~7.2 GB                      | unchanged             |
+| VRAM Usage          | ~7.2 GB              | ~7.2 GB                      | unchanged             |
 
 ---
 
@@ -67,7 +75,8 @@ Typical observed metrics:
 
 ## Unlocked HP/OMEN Dynamic Boost State
 
-After enabling the HP firmware-controlled performance state through the WMI control path:
+After enabling the HP firmware-controlled performance state through the WMI
+control path:
 
 * GPU sustained approximately 170–175W package power
 * GPU entered full P0 performance state
@@ -97,7 +106,9 @@ Under sustained AI inference workloads:
 * The cooling system stabilized without visible thermal runaway
 * Sustained boost behavior remained stable during long workloads
 
-This workload profile differs significantly from gaming loads because tensor workloads maintain near-continuous saturation rather than burst-style rendering behavior.
+This workload profile differs significantly from gaming loads because tensor
+workloads maintain near-continuous saturation rather than burst-style
+rendering behavior.
 
 Proper cooling is strongly recommended.
 
@@ -114,13 +125,18 @@ Suggested:
 
 The unlock does not directly overclock the GPU.
 
-Instead, the module enables the HP/OMEN firmware-controlled Dynamic Boost and TGP performance state normally unavailable under default Linux firmware behavior.
+It enables the HP/OMEN firmware-controlled Dynamic Boost and TGP performance
+state that is normally unavailable under default Linux firmware behavior.
 
-The implementation uses HP WMI ACPI methods exposed through:
+The implementation uses HP WMI ACPI methods:
 
 ```text
 WMAA -> WHCM -> GMCF -> GC21 / GC22
 ```
+
+The 80 W to 175 W path on AMD `8D87` is WMI `0x10` (EC user-define trigger) +
+`0x1a` (thermal profile) + GC22 (`CTGP`/`DTGP`). ACPI AFNC is not part of
+that path and is off by default.
 
 Relevant firmware variables include:
 
@@ -161,7 +177,6 @@ Board 8D87
 RTX 5080 Laptop GPU
 BIOS F.07
 Fedora 44
-Kernel 7.1.5-201.fc44.x86_64
 ```
 
 Behavior on other HP systems is not guaranteed.
@@ -170,8 +185,13 @@ Behavior on other HP systems is not guaranteed.
 
 # Conclusion
 
-The default Linux firmware state left substantial unused GPU thermal and power headroom on this system.
+The default Linux firmware state left substantial unused GPU thermal and power
+headroom on this system.
 
-Enabling the HP/OMEN firmware Dynamic Boost path increased sustained GPU package power from approximately 80W to approximately 175W and reduced the measured AI inference workload runtime from roughly 16.5–17 seconds to roughly 11 seconds.
+Enabling the HP/OMEN firmware Dynamic Boost path increased sustained GPU
+package power from approximately 80W to approximately 175W and reduced the
+measured AI inference workload runtime from roughly 16.5–17 seconds to roughly
+11 seconds.
 
-This represents a substantial real-world improvement for AI inference workloads on Linux-based HP OMEN systems.
+This represents a substantial real-world improvement for AI inference
+workloads on Linux-based HP OMEN systems.

@@ -21,7 +21,7 @@ systemctl status omen-wmi-boost-verify.service
 systemctl status omen-wmi-fan-control.service
 ```
 
-`gpu_state` should include `ctgp=1 ppab=1`.
+`gpu_state` should include `ctgp=1 dtgp=1`.
 
 ## Installed components
 
@@ -59,7 +59,9 @@ sudo systemctl restart omen-wmi-fan-control.service
 ## Fan controller
 
 Firmware remains in `auto` while the GPU is idle. Activity switches to the
-configured manual curve; workload duration can add heat-soak bias. Edit:
+configured manual curve; workload duration can add heat-soak bias after the
+GPU has reached `target_temp_c`. That extra cooling is kept through
+temperature dips until the soak score decays. Edit:
 
 ```text
 /etc/omen-wmi-fan-control.conf

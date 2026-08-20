@@ -4,9 +4,11 @@ This build talks to HP firmware through a small kernel module,
 `omen_wmi_boost`. Userspace scripts should not call ACPI/WMI directly; they use
 the sysfs files under `/sys/kernel/omen_wmi_boost/`.
 
-The module is validated on system board `8D87` and refuses other boards unless
-the operator explicitly sets `force_unsupported=1`. That override bypasses a
-safety check; it does not make the commands portable to other firmware.
+The module is validated on AMD system board `8D87` (OMEN MAX 16-ak0xxx) and
+refuses other boards unless the operator explicitly sets
+`force_unsupported=1`. That override bypasses a safety check; it does not make
+the commands portable to other firmware. Intel `8D87` configurations remain
+unvalidated.
 
 ## Firmware Paths
 
@@ -19,14 +21,16 @@ command: 0x00020008
 signature: 0x55434553 ("SECU")
 ```
 
-GPU power-limit request interface:
+GPU power-limit request interface (experimental, off by default):
 
 ```text
-set request: \_SB.PCI0.GPPA.VGA.AFNC(target, raw_value)
+gpu_power_request=1 gpu_power_path=<ACPI method>
 ```
 
-`AFNC` is queued internally by the module's `performance` path. It is not exposed
-as a user-facing profile control.
+On AMD `8D87`, `\_SB.PCI0.GPPA.VGA.AFNC` is the iGPU ATIF method, not a NVIDIA
+TGP control. The module does not call it unless `gpu_power_path` is set, and it
+refuses a `VGA.AFNC` path unless `gpu_power_allow_igpu=1`. The 175 W unlock
+does not depend on AFNC.
 
 ## GPU Unlock
 
@@ -38,11 +42,11 @@ echo 1 | sudo tee /sys/kernel/omen_wmi_boost/performance
 
 Internally this:
 
+- Calls HP WMI `0x10` (EC user-define trigger).
 - Calls HP WMI command `0x1a` with `thermal_profile`.
-- Calls HP WMI `GC22` (`0x22`) to set `CTGP=1` and `DTGP/ppab=1`.
-- Queues the firmware GPU power request with `AFNC`; the default raw value is
-  `0x0000015e`, matching the 175 W request used on this machine.
-- Preserves the firmware-reported `dstate` and `slowdown_temp`.
+- Calls HP WMI `GC22` (`0x22`) to set `CTGP=1` and `DTGP=1`.
+- Optionally evaluates an explicit `gpu_power_path` if `gpu_power_request=1`.
+- Preserves the firmware-reported `dstate`. GC22's fourth byte is unused padding.
 
 Useful readback:
 
@@ -53,8 +57,13 @@ cat /sys/kernel/omen_wmi_boost/gpu_state
 Expected unlocked state:
 
 ```text
-ctgp=1 ppab=1
+ctgp=1 dtgp=1
 ```
+
+`gpu_boost_set` retries the GC22 write up to five times on both enable and
+disable. It succeeds only when `CTGP` and `DTGP` match the requested state,
+and returns `-EIO` if they do not stick. Thermal `boost=0` therefore does not
+report success while the flags remain set.
 
 Accepted `thermal_profile` values are raw firmware bytes. This build defaults
 to `0x01`; `0x31` is also known from HP OMEN paths.
@@ -63,9 +72,7 @@ Power request module parameters:
 
 ```text
 force_unsupported=0
-gpu_power_request=1
-gpu_power_target=0
-gpu_power_raw=0x15e
+gpu_power_request=0
 ```
 
 ## Fan Control
@@ -73,7 +80,7 @@ gpu_power_raw=0x15e
 Fan controls use HP WMI fan commands, mainly:
 
 ```text
-0x10 fan count / trigger
+0x10 EC user-define trigger (also reports fan count)
 0x11 legacy RPM read
 0x26 max fan read
 0x27 max fan set
@@ -99,9 +106,9 @@ max    firmware max-fan mode
 ```
 
 Accepted `fan_speed` values are `0..255`, but writes only work while
-`fan_mode=manual`. The driver clamps to the discovered firmware fan table range.
-On this machine that has usually been around `19..60`, visible in `fan_state` as
-`speed_min` and `speed_max`.
+`fan_mode=manual`. The driver clamps to the discovered firmware fan table
+range. On the validated AMD `8D87` board that range has usually been around
+`19..60`, visible in `fan_state` as `speed_min` and `speed_max`.
 
 For automatic handoff:
 
@@ -133,8 +140,9 @@ target_temp_c=70
 ```
 
 Intermediate values are linearly interpolated. Workload heat-soak bias and
-rate limits are applied after interpolation; soak bias is active at or above
-the configured target.
+rate limits are applied after interpolation. Soak bias is earned at or above
+the configured target and is kept through temperature dips until the soak
+score decays. Busy workloads do not lower fan speed because temperature fell.
 
 Thermal protection is independent of the curve:
 
