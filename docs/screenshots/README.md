@@ -168,6 +168,8 @@ Potential impacts include:
 * increased fan noise
 * increased chassis heat
 * higher long-term hardware stress
+* incomplete S5 with an armed ~150 W GPU envelope if a USB device holds
+  the S5-powered xHCI (see `docs/S5-SAFETY.md`)
 
 This project was tested specifically on:
 

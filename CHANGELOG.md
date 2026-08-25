@@ -1,5 +1,21 @@
 # Changelog
 
+## 2.0.2
+
+- Clear `CTGP`/`DTGP` on `poweroff`/`reboot`/`halt` before `nvidia-powerd`
+  stops, and again from a kernel reboot notifier and module exit. A normal
+  shutdown does not unload the module, so the 150 W envelope previously stayed
+  armed.
+- Block `systemctl poweroff` while a non-hub USB device is present on ACPI
+  `XHC4`, the S5-powered xHCI on validated AMD `8D87`. Override with
+  `systemctl poweroff -i`. Last-chance shutdown still disarms TGP and logs an
+  emergency warning if that port is occupied.
+- If ACPI `XHC4` cannot be identified, do not inhibit shutdown; still disarm
+  the unlock flags.
+- Document incomplete-S5 + armed TGP as a hardware-damage hazard, with
+  physical checks (power LED, cold chassis) that software cannot replace
+  (`docs/S5-SAFETY.md`).
+
 ## 2.0.1
 
 - Stop calling `GPPA.VGA.AFNC` by default. On AMD `8D87` that ACPI method is

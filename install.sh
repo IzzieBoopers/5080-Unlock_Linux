@@ -84,15 +84,24 @@ install_configs() {
 	fi
 	install -m 644 "${REPO_ROOT}/config/omen-wmi-fan-control.conf.example" \
 		/etc/omen-wmi-fan-control.conf.example
+	if [[ -e /etc/omen-wmi-boost.conf ]]; then
+		log "Preserving existing /etc/omen-wmi-boost.conf"
+	fi
+	install -m 644 "${REPO_ROOT}/config/omen-wmi-boost.conf.example" \
+		/etc/omen-wmi-boost.conf.example
 }
 
 install_scripts() {
 	log "Installing helper scripts"
-	install -d /usr/local/sbin
+	install -d /usr/local/sbin /usr/local/lib/omen-wmi-boost
 	install -m 755 "${REPO_ROOT}/scripts/omen-wmi-boost-verify" /usr/local/sbin/
 	install -m 755 "${REPO_ROOT}/scripts/omen-wmi-boost-rebuild" /usr/local/sbin/
+	install -m 755 "${REPO_ROOT}/scripts/omen-wmi-boost-disarm" /usr/local/sbin/
+	install -m 755 "${REPO_ROOT}/scripts/omen-wmi-usb-s5-guard" /usr/local/sbin/
 	install -m 755 "${REPO_ROOT}/scripts/omen-wmi-fan-control" /usr/local/sbin/
 	install -m 755 "${REPO_ROOT}/scripts/omen-wmi-notify" /usr/local/sbin/
+	install -m 644 "${REPO_ROOT}/scripts/omen_wmi_usb_s5.py" \
+		/usr/local/lib/omen-wmi-boost/
 }
 
 install_systemd() {
@@ -100,14 +109,28 @@ install_systemd() {
 	install -d /etc/systemd/system
 	install -m 644 "${REPO_ROOT}/systemd/omen-wmi-boost-verify.service" /etc/systemd/system/
 	install -m 644 "${REPO_ROOT}/systemd/omen-wmi-fan-control.service" /etc/systemd/system/
+	install -m 644 "${REPO_ROOT}/systemd/omen-wmi-usb-s5-guard.service" /etc/systemd/system/
+	install -m 644 "${REPO_ROOT}/systemd/omen-wmi-usb-s5-inhibit.service" /etc/systemd/system/
 	systemctl daemon-reload
 	systemctl enable omen-wmi-boost-verify.service
+	systemctl enable omen-wmi-usb-s5-guard.service
+}
+
+install_udev() {
+	log "Installing USB-S5 udev rule"
+	install -d /etc/udev/rules.d
+	install -m 644 "${REPO_ROOT}/udev/99-omen-wmi-usb-s5.rules" /etc/udev/rules.d/
+	if command -v udevadm >/dev/null; then
+		udevadm control --reload-rules || true
+	fi
 }
 
 enable_controllers() {
 	log "Enabling fan controller service"
 	systemctl enable omen-wmi-fan-control.service
 	systemctl restart omen-wmi-fan-control.service
+	log "Refreshing USB-S5 shutdown inhibitor"
+	systemctl start omen-wmi-usb-s5-guard.service || true
 }
 
 install_kernel_hook() {
@@ -128,6 +151,7 @@ install_docs() {
 		"${REPO_ROOT}/docs/FAN-CONTROL.md" \
 		"${REPO_ROOT}/docs/FIRMWARE-CONTROLS.md" \
 		"${REPO_ROOT}/docs/REVERSE-ENGINEERING.md" \
+		"${REPO_ROOT}/docs/S5-SAFETY.md" \
 		/usr/share/doc/omen-wmi-boost/
 	install -d /usr/share/doc/omen-wmi-boost/LICENSES
 	install -m 644 "${REPO_ROOT}/LICENSES/"* \
@@ -206,11 +230,18 @@ do_dry_run() {
 	show_path_status /etc/modprobe.d/omen_wmi_boost.conf
 	show_path_status /etc/omen-wmi-fan-control.conf
 	show_path_status /etc/omen-wmi-fan-control.conf.example
+	show_path_status /etc/omen-wmi-boost.conf
+	show_path_status /etc/omen-wmi-boost.conf.example
 	show_path_status /etc/systemd/system/omen-wmi-boost-verify.service
 	show_path_status /etc/systemd/system/omen-wmi-fan-control.service
+	show_path_status /etc/systemd/system/omen-wmi-usb-s5-guard.service
+	show_path_status /etc/systemd/system/omen-wmi-usb-s5-inhibit.service
+	show_path_status /etc/udev/rules.d/99-omen-wmi-usb-s5.rules
 	show_path_status /etc/kernel/install.d/zz-omen-wmi-boost.install
 	show_path_status /usr/local/sbin/omen-wmi-boost-verify
 	show_path_status /usr/local/sbin/omen-wmi-boost-rebuild
+	show_path_status /usr/local/sbin/omen-wmi-boost-disarm
+	show_path_status /usr/local/sbin/omen-wmi-usb-s5-guard
 	show_path_status /usr/local/sbin/omen-wmi-fan-control
 	show_path_status /usr/local/sbin/omen-wmi-notify
 
@@ -239,6 +270,7 @@ do_install() {
 	install_configs
 	install_scripts
 	install_systemd
+	install_udev
 	install_kernel_hook
 	install_docs
 	smoke_test
@@ -257,7 +289,9 @@ do_uninstall() {
 	log "Removing omen_wmi_boost boot persistence"
 
 	systemctl disable --now omen-wmi-fan-control.service 2>/dev/null || true
+	systemctl disable --now omen-wmi-usb-s5-guard.service 2>/dev/null || true
 	systemctl disable --now omen-wmi-boost-verify.service 2>/dev/null || true
+	systemctl stop omen-wmi-usb-s5-inhibit.service 2>/dev/null || true
 	rm -f /etc/modprobe.d/omen_wmi_boost.conf
 
 	disable_boost
@@ -265,15 +299,27 @@ do_uninstall() {
 
 	rm -f /etc/modules-load.d/omen_wmi_boost.conf
 	rm -f /etc/omen-wmi-fan-control.conf.example
+	rm -f /etc/omen-wmi-boost.conf.example
 	rm -f /etc/systemd/system/omen-wmi-boost-verify.service
 	rm -f /etc/systemd/system/omen-wmi-fan-control.service
+	rm -f /etc/systemd/system/omen-wmi-usb-s5-guard.service
+	rm -f /etc/systemd/system/omen-wmi-usb-s5-inhibit.service
+	rm -f /etc/udev/rules.d/99-omen-wmi-usb-s5.rules
+	if command -v udevadm >/dev/null; then
+		udevadm control --reload-rules || true
+	fi
 	rm -f /etc/kernel/install.d/zz-omen-wmi-boost.install
 	rm -f /usr/local/sbin/omen-wmi-boost-verify
 	rm -f /usr/local/sbin/omen-wmi-boost-rebuild
+	rm -f /usr/local/sbin/omen-wmi-boost-disarm
+	rm -f /usr/local/sbin/omen-wmi-usb-s5-guard
 	rm -f /usr/local/sbin/omen-wmi-fan-control
 	rm -f /usr/local/sbin/omen-wmi-notify
+	rm -rf /usr/local/lib/omen-wmi-boost
 	rm -f /run/omen_wmi_boost.failed
 	rm -f /run/omen_wmi_boost.thermal
+	rm -f /run/omen_wmi_boost.usb-s5
+	rm -f /run/omen_wmi_boost.usb-s5.undetectable
 	rm -rf "$SRC_INSTALL"
 	rm -rf /usr/share/doc/omen-wmi-boost
 	rm -rf /var/lib/omen_wmi_boost
@@ -288,7 +334,7 @@ do_uninstall() {
 
 	systemctl daemon-reload
 	log "Uninstall complete. GPU boost flags were disabled before removal."
-	log "The repository checkout and user config /etc/omen-wmi-fan-control.conf were preserved."
+	log "The repository checkout and user configs /etc/omen-wmi-fan-control.conf and /etc/omen-wmi-boost.conf were preserved."
 }
 
 case "${1:-}" in

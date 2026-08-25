@@ -134,6 +134,9 @@ Safety thresholds override fan-curve preferences. If fan control fails near a
 thermal limit, the daemon disables boost and attempts firmware automatic fan
 control.
 
+Those fans do not run in incomplete S5. Shutdown rail/envelope risk is
+documented in `docs/S5-SAFETY.md`.
+
 ## Rate limiting and downshift hold
 
 ```ini

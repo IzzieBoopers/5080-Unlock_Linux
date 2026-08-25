@@ -19,6 +19,7 @@ cat /sys/kernel/omen_wmi_boost/gpu_state
 cat /sys/kernel/omen_wmi_boost/fan_state
 systemctl status omen-wmi-boost-verify.service
 systemctl status omen-wmi-fan-control.service
+systemctl status omen-wmi-usb-s5-inhibit.service
 ```
 
 `gpu_state` should include `ctgp=1 dtgp=1`.
@@ -31,10 +32,13 @@ systemctl status omen-wmi-fan-control.service
 - `/etc/modules-load.d/omen_wmi_boost.conf`
 - `/etc/omen-wmi-fan-control.conf`
 - `/etc/omen-wmi-fan-control.conf.example`
-- `/usr/local/sbin/omen-wmi-{boost-rebuild,boost-verify,fan-control,notify}`
-- `/etc/systemd/system/omen-wmi-{boost-verify,fan-control}.service`
+- `/etc/omen-wmi-boost.conf.example`
+- `/usr/local/sbin/omen-wmi-{boost-rebuild,boost-verify,boost-disarm,usb-s5-guard,fan-control,notify}`
+- `/usr/local/lib/omen-wmi-boost/omen_wmi_usb_s5.py`
+- `/etc/systemd/system/omen-wmi-{boost-verify,fan-control,usb-s5-guard,usb-s5-inhibit}.service`
+- `/etc/udev/rules.d/99-omen-wmi-usb-s5.rules`
 - `/etc/kernel/install.d/zz-omen-wmi-boost.install`
-- `/usr/share/doc/omen-wmi-boost/`
+- `/usr/share/doc/omen-wmi-boost/` (includes `S5-SAFETY.md`)
 
 Use `modinfo -n omen_wmi_boost` to see the actual module path.
 
@@ -43,6 +47,39 @@ Use `modinfo -n omen_wmi_boost` to see the actual module path.
 `omen-wmi-boost-verify.service` starts after module loading and NVIDIA power
 setup. It waits for the firmware flags to settle and re-applies performance if
 needed. The fan controller starts only after verification succeeds.
+
+## Shutdown and USB-S5
+
+**Hazard.** Incomplete S5 plus an armed TGP unlock can leave a ~150 W GPU
+envelope on a live rail after Linux says the machine is off. Fans follow the
+off policy. Bagging that, then pulling AC, is how this becomes a chassis
+furnace. See `docs/S5-SAFETY.md`.
+
+A normal `systemctl poweroff` does not unload `omen_wmi_boost`. Verify
+`ExecStop` writes `boost=0` (`CTGP=0 DTGP=0`) before `nvidia-powerd` stops. A
+kernel reboot notifier repeats that write if userspace teardown is skipped.
+
+On validated AMD `8D87`, ACPI `XHC4` is the S5-powered xHCI. Any non-hub USB
+device there can keep the discrete GPU rail alive after Linux claims off.
+While that controller is occupied, `omen-wmi-usb-s5-inhibit.service` blocks
+poweroff, reboot, and halt. Unplug the port, or override with:
+
+```bash
+systemctl poweroff -i
+```
+
+`-i` still runs TGP disarm and logs an emergency warning if `XHC4` is occupied.
+Clearing the unlock flags does not mean the dGPU rail is off.
+
+After every poweroff:
+
+1. Confirm the power LED actually goes dark. If it does not, hold power ~10 s.
+2. Leave the laptop on a hard surface until it is table-cold.
+3. Do not bag it or unplug AC until then.
+
+`usb_s5_inhibit=0` in `/etc/omen-wmi-boost.conf` disables the shutdown block
+but keeps detection and the last-chance warning. If ACPI `XHC4` cannot be
+identified, shutdown is not blocked.
 
 The Fedora kernel-install hook rebuilds the module for new kernels. If
 `kernel-devel` was not available during the RPM transaction, verification
@@ -110,8 +147,10 @@ echo 1 | sudo tee /sys/kernel/omen_wmi_boost/performance
 journalctl -t omen-wmi-boost -b
 journalctl -u omen-wmi-boost-verify.service -b
 journalctl -u omen-wmi-fan-control.service -b
+journalctl -u omen-wmi-usb-s5-guard.service -b
 cat /sys/kernel/omen_wmi_boost/last_error
 cat /sys/kernel/omen_wmi_boost/fan_state
+cat /run/omen_wmi_boost.usb-s5
 nvidia-smi
 ```
 
@@ -122,4 +161,5 @@ sudo ./install.sh --uninstall
 ```
 
 Installed binaries, source, services, documentation, and modules are removed.
-The repository checkout and user-edited `/etc/omen-wmi-fan-control.conf` remain.
+The repository checkout and user-edited `/etc/omen-wmi-fan-control.conf` and
+`/etc/omen-wmi-boost.conf` remain.

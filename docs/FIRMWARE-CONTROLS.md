@@ -65,6 +65,14 @@ disable. It succeeds only when `CTGP` and `DTGP` match the requested state,
 and returns `-EIO` if they do not stick. Thermal `boost=0` therefore does not
 report success while the flags remain set.
 
+On `poweroff`, `reboot`, and `halt`, userspace `omen-wmi-boost-disarm` writes
+`boost=0` before `nvidia-powerd` stops. The module also registers a reboot
+notifier and disarms on `rmmod`, because a normal shutdown does not unload the
+module. That clears the 150 W envelope; it does not power-off PEGP if a USB
+device is holding the S5-powered `XHC4` island. Incomplete S5 with that
+envelope still armed is a bag-and-unplug thermal hazard. Mitigation steps
+are in `docs/S5-SAFETY.md`.
+
 Accepted `thermal_profile` values are raw firmware bytes. This build defaults
 to `0x01`; `0x31` is also known from HP OMEN paths.
 

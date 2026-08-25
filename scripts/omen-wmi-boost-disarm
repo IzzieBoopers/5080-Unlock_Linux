@@ -1,0 +1,93 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""Clear CTGP/DTGP before nvidia-powerd stops; warn if USB-S5 is still occupied."""
+
+from __future__ import annotations
+
+import subprocess
+import sys
+from pathlib import Path
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+for candidate in (SCRIPT_DIR, Path("/usr/local/lib/omen-wmi-boost")):
+    if (candidate / "omen_wmi_usb_s5.py").is_file():
+        sys.path.insert(0, str(candidate))
+        break
+
+import omen_wmi_usb_s5 as usb_s5  # noqa: E402
+
+TAG = "omen-wmi-boost"
+SYSFS = Path("/sys/kernel/omen_wmi_boost")
+BOOST = SYSFS / "boost"
+GPU_STATE = SYSFS / "gpu_state"
+LAST_ERROR = SYSFS / "last_error"
+
+
+def log(message: str, priority: str = "user.info") -> None:
+    subprocess.run(
+        ["logger", "-t", TAG, "-p", priority, message],
+        check=False,
+    )
+
+
+def wall(message: str) -> None:
+    subprocess.run(["wall", message], check=False)
+
+
+def flags_cleared(state: str) -> bool:
+    return "ctgp=0" in state and "dtgp=0" in state
+
+
+def disarm_flags() -> None:
+    if not BOOST.is_file():
+        log("boost sysfs missing; kernel reboot notifier must clear CTGP/DTGP")
+        return
+    if not os_write_boost():
+        log("failed to write boost=0", "user.err")
+        return
+    if not GPU_STATE.is_file():
+        log("gpu_state missing after boost=0", "user.err")
+        return
+    state = GPU_STATE.read_text(encoding="utf-8").strip()
+    if flags_cleared(state):
+        log(f"CTGP/DTGP cleared before poweroff ({state})")
+        return
+    detail = state
+    if LAST_ERROR.is_file():
+        err = LAST_ERROR.read_text(encoding="utf-8").strip()
+        if err:
+            detail = f"{state}; last_error={err}"
+    log(f"CTGP/DTGP did not clear before poweroff ({detail})", "user.err")
+
+
+def os_write_boost() -> bool:
+    try:
+        BOOST.write_text("0\n", encoding="utf-8")
+        return True
+    except OSError:
+        return False
+
+
+def warn_usb_s5() -> None:
+    settings = usb_s5.parse_config()
+    status = usb_s5.assess(acpi_name=settings.acpi_name)
+    if not status.occupied:
+        return
+    message = (
+        "omen_wmi_boost: USB-S5 still occupied on "
+        f"{status.acpi_name} ({','.join(status.ports)}). "
+        "Firmware may leave the discrete GPU rail on after poweroff. "
+        "Watch the power LED and do not bag the machine until it is cold."
+    )
+    log(message, "user.emerg")
+    wall(message)
+
+
+def main() -> int:
+    disarm_flags()
+    warn_usb_s5()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

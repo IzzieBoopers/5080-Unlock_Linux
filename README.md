@@ -13,6 +13,15 @@ This software changes firmware-controlled GPU power and cooling behavior.
 Higher performance means substantially more heat, power draw, fan noise, and
 hardware stress. Monitor temperatures and keep intake and exhaust paths clear.
 
+**Incomplete S5 is a hardware-damage hazard.** The unlock arms a ~150 W GPU
+power envelope (firmware max 175 W). A USB device on the S5-powered `XHC4`
+controller can keep the discrete GPU rail alive after Fedora claims off, with
+fans in the off policy. Bagging that state, then unplugging AC, can cook the
+chassis and battery. 2.0.2 disarms `CTGP`/`DTGP` on shutdown and blocks
+`poweroff` while `XHC4` is occupied; that does **not** prove the rail is off.
+Watch the power LED, force-off if it stays on, and wait until the machine is
+table-cold before fabric. Full write-up: `docs/S5-SAFETY.md`.
+
 Validated platform:
 
 - HP OMEN MAX Gaming Laptop 16-ak0xxx (AMD)
@@ -45,6 +54,8 @@ Do not use it merely to bypass an installation error.
 - Returns fan control to firmware when the GPU becomes idle.
 - Warns at high temperature and disables the unlock at a configurable critical
   threshold.
+- Clears the GPU unlock on shutdown/reboot, and blocks poweroff while a USB
+  device occupies the S5-powered `XHC4` controller.
 - Rebuilds the out-of-tree module after Fedora kernel updates and repairs a
   missing module at the next verification boot.
 
@@ -86,9 +97,11 @@ cat /sys/kernel/omen_wmi_boost/gpu_state
 cat /sys/kernel/omen_wmi_boost/fan_state
 systemctl status omen-wmi-boost-verify.service
 systemctl status omen-wmi-fan-control.service
+systemctl status omen-wmi-usb-s5-inhibit.service
 ```
 
-Expected GPU state includes `ctgp=1 dtgp=1`.
+Expected GPU state includes `ctgp=1 dtgp=1`. The USB-S5 inhibit unit should be
+inactive while `XHC4` has no non-hub devices.
 
 ## Default AI cooling policy
 
@@ -204,7 +217,8 @@ sudo systemctl restart omen-wmi-boost-verify.service
 ## Uninstall
 
 The uninstaller disables boost, removes installed modules and services, and
-preserves the user-edited fan config:
+preserves user-edited `/etc/omen-wmi-fan-control.conf` and
+`/etc/omen-wmi-boost.conf`:
 
 ```bash
 sudo ./install.sh --uninstall
@@ -224,9 +238,10 @@ Explicit privileged hardware integration test:
 sudo ./run-tests.sh --hardware
 ```
 
-See `docs/BOOT-SETUP.md`, `docs/FAN-CONTROL.md`,
+See `docs/S5-SAFETY.md`, `docs/BOOT-SETUP.md`, `docs/FAN-CONTROL.md`,
 `docs/FIRMWARE-CONTROLS.md`, `docs/REVERSE-ENGINEERING.md`, and
-`docs/screenshots/README.md` for operational, firmware, and validation details.
+`docs/screenshots/README.md` for safety, operational, firmware, and
+validation details.
 
 ## License
 

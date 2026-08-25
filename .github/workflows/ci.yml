@@ -24,14 +24,17 @@ jobs:
         run: |
           bash -n install.sh run-tests.sh kernel/install.d/zz-omen-wmi-boost.install scripts/omen-wmi-boost-rebuild scripts/omen-wmi-boost-verify scripts/omen-wmi-notify
           shellcheck install.sh run-tests.sh kernel/install.d/zz-omen-wmi-boost.install scripts/omen-wmi-boost-rebuild scripts/omen-wmi-boost-verify scripts/omen-wmi-notify
+          python3 -m py_compile scripts/omen_wmi_usb_s5.py scripts/omen-wmi-usb-s5-guard scripts/omen-wmi-boost-disarm
 
       - name: Run fan policy tests
         run: python3 -m unittest discover -s tests -v
 
       - name: Verify systemd units
         run: |
+          install -d /usr/local/sbin /usr/local/lib/omen-wmi-boost
           install -m 755 scripts/omen-wmi-* /usr/local/sbin/
-          systemd-analyze verify systemd/omen-wmi-boost-verify.service systemd/omen-wmi-fan-control.service
+          install -m 644 scripts/omen_wmi_usb_s5.py /usr/local/lib/omen-wmi-boost/
+          systemd-analyze verify systemd/omen-wmi-boost-verify.service systemd/omen-wmi-fan-control.service systemd/omen-wmi-usb-s5-guard.service systemd/omen-wmi-usb-s5-inhibit.service
 
       - name: Build kernel module
         run: |

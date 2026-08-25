@@ -11,6 +11,8 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/notifier.h>
+#include <linux/reboot.h>
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/sysfs.h>
@@ -170,6 +172,7 @@ static struct {
 	struct kobject *kobj;
 	struct mutex lock;
 	bool wmi_ready;
+	bool reboot_nb_registered;
 	char last_error[128];
 	struct fan_control_state fan;
 } omen_drv;
@@ -727,6 +730,36 @@ static int gpu_boost_set(bool enable)
 	return -EIO;
 }
 
+static void omen_disarm_unlock(const char *reason)
+{
+	int ret;
+
+	if (!omen_drv.wmi_ready)
+		return;
+
+	mutex_lock(&omen_drv.lock);
+	ret = gpu_boost_set(false);
+	mutex_unlock(&omen_drv.lock);
+	if (ret)
+		pr_emerg("failed to clear CTGP/DTGP (%s): %d\n", reason, ret);
+	else
+		pr_info("CTGP/DTGP cleared (%s)\n", reason);
+}
+
+static int omen_reboot_notify(struct notifier_block *nb, unsigned long mode,
+			      void *unused)
+{
+	(void)nb;
+	(void)mode;
+	(void)unused;
+	omen_disarm_unlock("reboot notifier");
+	return NOTIFY_OK;
+}
+
+static struct notifier_block omen_reboot_nb = {
+	.notifier_call = omen_reboot_notify,
+};
+
 static int performance_apply(void)
 {
 	int ret;
@@ -1164,6 +1197,14 @@ static int __init omen_wmi_boost_init(void)
 		pr_info("sysfs: /sys/kernel/%s/{gpu_state,last_error,boost,performance,thermal_profile,fan_state,fan_mode,fan_speed,fan_probe}\n",
 			DRV_NAME);
 
+		ret = register_reboot_notifier(&omen_reboot_nb);
+		if (ret) {
+			pr_err("reboot notifier failed: %d\n", ret);
+			omen_sysfs_remove();
+			return ret;
+		}
+		omen_drv.reboot_nb_registered = true;
+
 		if (auto_boost) {
 			guard(mutex)(&omen_drv.lock);
 			omen_clear_last_error();
@@ -1193,6 +1234,11 @@ static int __init omen_wmi_boost_init(void)
 
 static void __exit omen_wmi_boost_exit(void)
 {
+	if (omen_drv.reboot_nb_registered) {
+		unregister_reboot_notifier(&omen_reboot_nb);
+		omen_drv.reboot_nb_registered = false;
+	}
+	omen_disarm_unlock("module exit");
 	fan_control_exit();
 	omen_sysfs_remove();
 }
@@ -1203,5 +1249,5 @@ module_exit(omen_wmi_boost_exit);
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("HP OMEN WMI GPU power unlock and fan control");
 MODULE_AUTHOR("5080_Unlock");
-MODULE_VERSION("2.0.1");
+MODULE_VERSION("2.0.2");
 MODULE_SOFTDEP("pre: wmi");

@@ -51,6 +51,9 @@ that firmware does not read or write.
 The project does not overclock the GPU. It enables the OEM firmware performance
 state that HP's Windows tooling/platform profile path normally controls.
 
+That envelope must be disarmed at S5. A USB device on ACPI `XHC4` can still
+leave the dGPU rail up. See `docs/S5-SAFETY.md`.
+
 ## Validation Boundary
 
 The command set is validated on HP board `8D87`, OMEN MAX Gaming Laptop

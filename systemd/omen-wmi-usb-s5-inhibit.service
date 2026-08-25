@@ -1,0 +1,7 @@
+[Unit]
+Description=Block shutdown while a USB device occupies the S5-powered xHCI
+Documentation=file:/usr/share/doc/omen-wmi-boost/BOOT-SETUP.md
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/systemd-inhibit --what=shutdown --mode=block --who=omen-wmi-boost --why="USB device on S5-powered XHC4; poweroff may leave the dGPU rail on. Unplug that port, or use poweroff -i after reading docs." /usr/bin/sleep infinity

@@ -7,6 +7,8 @@ After=systemd-modules-load.service nvidia-powerd.service
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=/usr/local/sbin/omen-wmi-boost-verify
+ExecStop=/usr/local/sbin/omen-wmi-boost-disarm
+TimeoutStopSec=20
 
 [Install]
 WantedBy=multi-user.target

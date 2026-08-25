@@ -1,0 +1,3 @@
+# SPDX-License-Identifier: MIT
+# Refresh the USB-S5 shutdown inhibitor when USB devices appear or leave.
+ACTION=="add|remove", SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", RUN+="/usr/bin/systemctl --no-block start omen-wmi-usb-s5-guard.service"
