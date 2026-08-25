@@ -48,7 +48,9 @@ UNLOCK_DISABLE_TEMP_C = 85
 CRITICAL_SAMPLES = 2
 WARNING_REPEAT_S = 300
 RAMP_UP_STEP = 20
-RAMP_DOWN_STEP = 5
+RAMP_DOWN_STEP = 1
+RAMP_DOWN_DWELL_S = 12
+TEMP_EMA_ALPHA_PERCENT = 50
 
 
 class FanControlError(RuntimeError):
@@ -77,7 +79,7 @@ class FanSettings:
     soak_max_bias_percent: int = SOAK_MAX_BIAS_PERCENT
     soak_gap_hold_s: int = SOAK_GAP_HOLD_S
     soak_decay_s: int = SOAK_DECAY_S
-    # Deprecated input aliases retained for personal-build upgrades.
+    # Deprecated input aliases retained for existing configurations.
     failsafe_temp_c: int = FAILSAFE_TEMP_C
     failsafe_rise_c: int = FAILSAFE_RISE_C
     warning_temp_c: int = WARNING_TEMP_C
@@ -87,6 +89,8 @@ class FanSettings:
     warning_repeat_s: int = WARNING_REPEAT_S
     ramp_up_step: int = RAMP_UP_STEP
     ramp_down_step: int = RAMP_DOWN_STEP
+    ramp_down_dwell_s: int = RAMP_DOWN_DWELL_S
+    temp_ema_alpha_percent: int = TEMP_EMA_ALPHA_PERCENT
     active_hold_multiplier: int = ACTIVE_HOLD_MULTIPLIER
 
 
@@ -227,6 +231,11 @@ def validate_settings(settings: FanSettings, path: Path) -> None:
     require(settings.warning_repeat_s > 0, "warning_repeat_s must be > 0")
     require(settings.ramp_up_step > 0, "ramp_up_step must be > 0")
     require(settings.ramp_down_step > 0, "ramp_down_step must be > 0")
+    require(settings.ramp_down_dwell_s >= 0, "ramp_down_dwell_s must be >= 0")
+    require(
+        0 <= settings.temp_ema_alpha_percent <= 100,
+        "temp_ema_alpha_percent must be 0..100",
+    )
     require(settings.active_hold_multiplier >= 0, "active_hold_multiplier must be >= 0")
 
 
@@ -258,6 +267,10 @@ class Controller:
         self.boost_disabled = False
         self.last_warning_at: float | None = None
         self.last_temp: int | None = None
+        self.filtered_temp: float | None = None
+        self.last_filtered_temp: float | None = None
+        self.last_temp_rise_at: float | None = None
+        self.soak_earned = False
         self.running = True
         self.log(f"loaded fan config: {self.config}")
 
@@ -380,30 +393,37 @@ class Controller:
         self.log(f"failure: {reason}; falling back to fan_mode=auto")
         self.set_auto()
 
-    def curve_percent(self, temp: int, active: bool = True) -> int:
+    def curve_percent(self, temp: float, active: bool = True) -> int:
         curve = self.settings.fan_curve
         if temp <= curve[0][0]:
-            fan = curve[0][1]
+            fan = float(curve[0][1])
         elif temp >= curve[-1][0]:
-            fan = curve[-1][1]
+            fan = float(curve[-1][1])
         else:
-            fan = curve[-1][1]
+            fan = float(curve[-1][1])
             for (low_temp, low_fan), (high_temp, high_fan) in zip(
                 curve, curve[1:]
             ):
                 if temp <= high_temp:
                     temp_span = high_temp - low_temp
                     fan_span = high_fan - low_fan
-                    fan = low_fan + ((temp - low_temp) * fan_span) // temp_span
+                    fan = low_fan + ((temp - low_temp) * fan_span) / temp_span
                     break
 
         if active:
-            fan = max(fan, self.settings.active_fan_floor)
-        return max(0, min(100, fan))
+            fan = max(fan, float(self.settings.active_fan_floor))
+        return max(0, min(100, int(round(fan))))
 
-    def target_percent(self, temp: int, active: bool, soak_bias: int) -> int:
+    def target_percent(
+        self,
+        temp: float,
+        active: bool,
+        soak_bias: int,
+        raw_temp: int | None = None,
+    ) -> int:
         target = self.curve_percent(temp, active=active) + soak_bias
-        if temp >= self.settings.warning_temp_c:
+        warning_temp = raw_temp if raw_temp is not None else temp
+        if warning_temp >= self.settings.warning_temp_c:
             target = max(target, self.settings.warning_fan_percent)
         return min(100, target)
 
@@ -461,6 +481,56 @@ class Controller:
         steps = 1 + int((self.soak_score_s - settings.soak_after_s) // settings.soak_step_s)
         bias = steps * settings.soak_step_percent
         return min(settings.soak_max_bias_percent, bias)
+
+    def update_soak_earned(self, active: bool, control_temp: float) -> None:
+        if not active or self.soak_bias_percent() == 0:
+            self.soak_earned = False
+            return
+        if control_temp >= self.settings.target_temp_c:
+            self.soak_earned = True
+
+    def applied_soak_bias(self, active: bool) -> int:
+        if not active or not self.soak_earned:
+            return 0
+        return self.soak_bias_percent()
+
+    def update_filtered_temp(self, raw_temp: int) -> float:
+        alpha = self.settings.temp_ema_alpha_percent
+        if self.filtered_temp is None or alpha <= 0:
+            self.filtered_temp = float(raw_temp)
+            return self.filtered_temp
+        self.filtered_temp += (alpha / 100.0) * (raw_temp - self.filtered_temp)
+        return self.filtered_temp
+
+    def note_temp_rise(self, filtered: float, now: float) -> None:
+        if self.last_filtered_temp is None or filtered > self.last_filtered_temp:
+            self.last_temp_rise_at = now
+        self.last_filtered_temp = filtered
+
+    def command_percent(
+        self,
+        desired: int,
+        workload_busy: bool,
+        now: float,
+        emergency: bool = False,
+    ) -> int:
+        if emergency:
+            self.current_percent = desired
+            return desired
+
+        if self.current_percent is None:
+            return self.rate_limit(desired)
+
+        if desired < self.current_percent:
+            if workload_busy:
+                return self.current_percent
+            if (
+                self.last_temp_rise_at is not None
+                and now - self.last_temp_rise_at < self.settings.ramp_down_dwell_s
+            ):
+                return self.current_percent
+
+        return self.rate_limit(desired)
 
     def rate_limit(self, target: int) -> int:
         if self.current_percent is None:
@@ -585,6 +655,7 @@ class Controller:
         )
         self.thermal_latched = True
         self.current_percent = None
+        self.soak_earned = False
         self.reset_active_hold()
 
     def should_be_active(self, temp: int, util: int, clock: int) -> bool:
@@ -619,8 +690,8 @@ class Controller:
         return False
 
     def tick(self) -> None:
-        temp, util, power, clock = self.read_gpu()
-        self.last_temp = temp
+        raw_temp, util, power, clock = self.read_gpu()
+        self.last_temp = raw_temp
         state = self.read_fan_state()
         now = time.monotonic()
 
@@ -632,36 +703,46 @@ class Controller:
                 self.boost_disabled = True
             self.log(
                 "thermal protection latched: "
-                f"temp={temp}C util={util}% clock={clock}MHz power={power:.1f}W "
+                f"temp={raw_temp}C util={util}% clock={clock}MHz power={power:.1f}W "
                 "fan_mode=max boost=disabled"
             )
             return
 
-        if self.update_critical_count(temp):
-            self.trip_thermal_protection(temp, state)
+        if self.update_critical_count(raw_temp):
+            self.trip_thermal_protection(raw_temp, state)
             return
 
-        active = self.should_be_active(temp, util, clock)
+        active = self.should_be_active(raw_temp, util, clock)
         workload_busy = self.workload_busy(util, power, clock)
         self.update_soak_score(workload_busy, now)
-        soak_bias = (
-            self.soak_bias_percent()
-            if active and temp >= self.settings.target_temp_c
-            else 0
-        )
-        if temp >= self.settings.warning_temp_c:
-            self.emit_thermal_warning(temp, now)
+        warning = raw_temp >= self.settings.warning_temp_c
+        filtered = self.update_filtered_temp(raw_temp)
+        self.note_temp_rise(filtered, now)
+        control_temp = float(raw_temp) if warning else filtered
+        self.update_soak_earned(active, control_temp)
+        soak_bias = self.applied_soak_bias(active)
+        if warning:
+            self.emit_thermal_warning(raw_temp, now)
         self.log(
             "telemetry: "
-            f"temp={temp}C util={util}% clock={clock}MHz power={power:.1f}W "
+            f"temp={raw_temp}C filtered={filtered:.1f}C util={util}% "
+            f"clock={clock}MHz power={power:.1f}W "
             f"active={int(active)} workload={int(workload_busy)} "
             f"hold={self.active_hold_s:.0f}s soak={self.soak_score_s:.0f}s "
-            f"soak_bias={soak_bias}% critical_samples={self.critical_count}"
+            f"soak_earned={int(self.soak_earned)} soak_bias={soak_bias}% "
+            f"critical_samples={self.critical_count}"
         )
 
         if active:
-            target = self.target_percent(temp, active=True, soak_bias=soak_bias)
-            limited = self.rate_limit(target)
+            target = self.target_percent(
+                control_temp,
+                active=True,
+                soak_bias=soak_bias,
+                raw_temp=raw_temp,
+            )
+            limited = self.command_percent(
+                target, workload_busy, now, emergency=warning
+            )
             self.apply_manual(limited, state)
         else:
             self.current_percent = None

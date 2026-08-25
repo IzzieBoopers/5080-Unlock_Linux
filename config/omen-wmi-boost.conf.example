@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: MIT
+# USB-S5 shutdown guard. Copy to /etc/omen-wmi-boost.conf to override.
+
+# ACPI wakeup device for the S5-powered xHCI on validated AMD 8D87.
+usb_s5_acpi=XHC4
+
+# 1: block systemctl poweroff/reboot/halt while that controller has a
+#    non-hub USB device. Override a block with: systemctl poweroff -i
+# 0: warn only; last-chance emergency log on ExecStop still runs.
+#    Incomplete S5 can still leave a hot dGPU rail after "poweroff".
+#    See docs/S5-SAFETY.md. Do not bag the machine until the LED is off
+#    and the chassis is cold.
+usb_s5_inhibit=1

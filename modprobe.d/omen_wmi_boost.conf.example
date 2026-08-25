@@ -5,4 +5,4 @@
 #   sudo cp modprobe.d/omen_wmi_boost.conf /etc/modprobe.d/
 #   sudo cp modules-load.d/omen_wmi_boost.conf /etc/modules-load.d/
 
-options omen_wmi_boost persist=1 auto_boost=1 force_unsupported=0 thermal_profile=1 gpu_power_request=1 gpu_power_target=0 gpu_power_raw=0x15e
+options omen_wmi_boost persist=1 auto_boost=1 force_unsupported=0 thermal_profile=1 gpu_power_request=0

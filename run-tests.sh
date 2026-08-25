@@ -18,6 +18,11 @@ run_static() {
 		"$ROOT/scripts/omen-wmi-boost-verify" \
 		"$ROOT/scripts/omen-wmi-notify"
 
+	python3 -m py_compile \
+		"$ROOT/scripts/omen_wmi_usb_s5.py" \
+		"$ROOT/scripts/omen-wmi-usb-s5-guard" \
+		"$ROOT/scripts/omen-wmi-boost-disarm"
+
 	if command -v shellcheck >/dev/null; then
 		log "Running ShellCheck"
 		shellcheck \
@@ -33,9 +38,20 @@ run_static() {
 	python3 -m unittest discover -s "$ROOT/tests" -v
 
 	log "Validating systemd units"
-	systemd-analyze verify \
+	unit_dir=$(mktemp -d)
+	sed "s|/usr/local/sbin|${ROOT}/scripts|g" \
 		"$ROOT/systemd/omen-wmi-boost-verify.service" \
-		"$ROOT/systemd/omen-wmi-fan-control.service"
+		> "${unit_dir}/omen-wmi-boost-verify.service"
+	sed "s|/usr/local/sbin|${ROOT}/scripts|g" \
+		"$ROOT/systemd/omen-wmi-fan-control.service" \
+		> "${unit_dir}/omen-wmi-fan-control.service"
+	sed "s|/usr/local/sbin|${ROOT}/scripts|g" \
+		"$ROOT/systemd/omen-wmi-usb-s5-guard.service" \
+		> "${unit_dir}/omen-wmi-usb-s5-guard.service"
+	cp "$ROOT/systemd/omen-wmi-usb-s5-inhibit.service" \
+		"${unit_dir}/omen-wmi-usb-s5-inhibit.service"
+	systemd-analyze verify "${unit_dir}"/*.service
+	rm -rf "$unit_dir"
 
 	log "Building kernel module for $(uname -r)"
 	make -C "$ROOT/omen_wmi_boost" clean

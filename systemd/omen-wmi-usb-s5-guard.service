@@ -1,0 +1,11 @@
+[Unit]
+Description=Refresh HP OMEN USB-S5 shutdown inhibitor
+Documentation=file:/usr/share/doc/omen-wmi-boost/BOOT-SETUP.md
+After=local-fs.target systemd-udevd.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/omen-wmi-usb-s5-guard
+
+[Install]
+WantedBy=multi-user.target

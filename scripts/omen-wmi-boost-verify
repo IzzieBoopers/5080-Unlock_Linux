@@ -40,13 +40,13 @@ pass() {
 }
 
 boost_active() {
-	local state ctgp ppab
+	local state ctgp dtgp
 
 	[[ -r "$SYSFS" ]] || return 1
 	read -r state <"$SYSFS" || return 1
 	ctgp=$(sed -n 's/.*ctgp=\([0-9]*\).*/\1/p' <<<"$state")
-	ppab=$(sed -n 's/.*ppab=\([0-9]*\).*/\1/p' <<<"$state")
-	[[ "$ctgp" == "1" && "$ppab" == "1" ]]
+	dtgp=$(sed -n 's/.*dtgp=\([0-9]*\).*/\1/p' <<<"$state")
+	[[ "$ctgp" == "1" && "$dtgp" == "1" ]]
 }
 
 reapply_performance() {

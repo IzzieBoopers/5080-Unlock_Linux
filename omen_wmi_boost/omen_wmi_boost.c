@@ -11,6 +11,8 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/notifier.h>
+#include <linux/reboot.h>
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/sysfs.h>
@@ -42,9 +44,9 @@
 #define HP_FAN_KEEPALIVE_SECS		90
 #define HP_FAN_DEFAULT_MAX_SPEED	60
 
-#define HP_GPU_ATIF_AFNC_PATH		"\\_SB.PCI0.GPPA.VGA.AFNC"
 #define HP_GPU_ATIF_DEFAULT_TARGET	0
 #define HP_GPU_ATIF_DEFAULT_RAW_LIMIT	0x0000015e
+#define HP_GPU_AFNC_IGPU_SUFFIX		".VGA.AFNC"
 #define OMEN_SUPPORTED_BOARD_NAME	"8D87"
 #define OMEN_SUPPORTED_PRODUCT_NAME	"OMEN MAX Gaming Laptop 16-ak0xxx"
 
@@ -68,10 +70,10 @@ struct bios_return {
 
 struct gpu_power_modes {
 	u8 ctgp;
-	u8 ppab;
+	u8 dtgp;
 	u8 dstate;
-	u8 slowdown_temp;
-};
+	u8 unused; /* GC21/GC22 do not use this byte; keep the 4-byte payload */
+} __packed;
 
 struct victus_s_fan_table_header {
 	u8 num_fans;
@@ -131,10 +133,20 @@ static u8 thermal_profile = HP_THERMAL_VICTUS_S_PERFORMANCE;
 module_param(thermal_profile, byte, 0644);
 MODULE_PARM_DESC(thermal_profile, "SET_PERFORMANCE_MODE byte (1 or 0x31)");
 
-static bool gpu_power_request = true;
+static bool gpu_power_request;
 module_param(gpu_power_request, bool, 0644);
 MODULE_PARM_DESC(gpu_power_request,
-		 "Request firmware GPU power limit during performance apply");
+		 "Evaluate gpu_power_path during performance apply (default: N)");
+
+static char gpu_power_path[128];
+module_param_string(gpu_power_path, gpu_power_path, sizeof(gpu_power_path), 0644);
+MODULE_PARM_DESC(gpu_power_path,
+		 "ACPI method path for experimental AFNC; empty skips AFNC");
+
+static bool gpu_power_allow_igpu;
+module_param(gpu_power_allow_igpu, bool, 0644);
+MODULE_PARM_DESC(gpu_power_allow_igpu,
+		 "Allow AFNC on a VGA/iGPU path such as GPPA.VGA.AFNC (unsafe; default: N)");
 
 static uint gpu_power_target = HP_GPU_ATIF_DEFAULT_TARGET;
 module_param(gpu_power_target, uint, 0644);
@@ -160,6 +172,7 @@ static struct {
 	struct kobject *kobj;
 	struct mutex lock;
 	bool wmi_ready;
+	bool reboot_nb_registered;
 	char last_error[128];
 	struct fan_control_state fan;
 } omen_drv;
@@ -256,8 +269,8 @@ out:
 
 static void gpu_modes_log(const char *tag, const struct gpu_power_modes *m)
 {
-	pr_info("%s: CTGP=%u DTGP=%u DSTA=%u slowdown_temp=%u\n",
-		tag, m->ctgp, m->ppab, m->dstate, m->slowdown_temp);
+	pr_info("%s: CTGP=%u DTGP=%u DSTA=%u\n",
+		tag, m->ctgp, m->dtgp, m->dstate);
 }
 
 static int gpu_modes_read(struct gpu_power_modes *modes)
@@ -279,14 +292,20 @@ static int gpu_modes_write(bool enable, const struct gpu_power_modes *cur)
 {
 	struct gpu_power_modes set = {
 		.ctgp = enable ? 1 : 0,
-		.ppab = enable ? 1 : 0,
+		.dtgp = enable ? 1 : 0,
 		.dstate = cur->dstate,
-		.slowdown_temp = cur->slowdown_temp,
+		.unused = 0,
 	};
 
 	return hp_gm_query(HPWMI_SET_GPU_THERMAL_MODES, &set, sizeof(set), 0);
 }
 
+/*
+ * HPWMI_FAN_COUNT_GET_QUERY (0x10) has an EC side effect: it keeps the
+ * machine in the user-defined thermal/power state instead of falling back.
+ * Same role as hp_wmi_get_fan_count_userdefine_trigger() in upstream hp-wmi.
+ * The returned count is unused here.
+ */
 static int fan_trigger(void)
 {
 	u8 data[4] = { 0 };
@@ -601,6 +620,22 @@ static int thermal_profile_set(u8 profile)
 	return hp_gm_query(HPWMI_SET_PERFORMANCE_MODE, buf, sizeof(buf), 0);
 }
 
+static bool gpu_power_path_is_igpu(const char *path)
+{
+	size_t len;
+	size_t suffix_len = sizeof(HP_GPU_AFNC_IGPU_SUFFIX) - 1;
+
+	if (!path || !path[0])
+		return false;
+	if (strstr(path, "GPPA.VGA.AFNC"))
+		return true;
+	len = strlen(path);
+	if (len >= suffix_len &&
+	    !strcmp(path + len - suffix_len, HP_GPU_AFNC_IGPU_SUFFIX))
+		return true;
+	return false;
+}
+
 static int gpu_power_limit_request(void)
 {
 	union acpi_object args[2];
@@ -614,12 +649,23 @@ static int gpu_power_limit_request(void)
 	if (!gpu_power_request)
 		return 0;
 
+	if (!gpu_power_path[0]) {
+		pr_info("AFNC skipped: gpu_power_path is unset (VGA.AFNC is AMD iGPU ATIF, not NVIDIA TGP)\n");
+		return 0;
+	}
+
+	if (gpu_power_path_is_igpu(gpu_power_path) && !gpu_power_allow_igpu) {
+		pr_warn("refusing %s: that method is the AMD iGPU ATIF, not the NVIDIA GPU; set gpu_power_allow_igpu=1 to override\n",
+			gpu_power_path);
+		return -EINVAL;
+	}
+
 	if (gpu_power_target > U8_MAX)
 		return -EINVAL;
 
-	ast = acpi_get_handle(NULL, HP_GPU_ATIF_AFNC_PATH, &handle);
+	ast = acpi_get_handle(NULL, gpu_power_path, &handle);
 	if (ACPI_FAILURE(ast)) {
-		pr_warn("ACPI handle %s not found: %s\n", HP_GPU_ATIF_AFNC_PATH,
+		pr_warn("ACPI handle %s not found: %s\n", gpu_power_path,
 			acpi_format_exception(ast));
 		return -ENODEV;
 	}
@@ -631,13 +677,14 @@ static int gpu_power_limit_request(void)
 
 	ast = acpi_evaluate_object(handle, NULL, &arg_list, NULL);
 	if (ACPI_FAILURE(ast)) {
-		pr_warn("AFNC target=%u raw=0x%x failed: %s\n",
-			gpu_power_target, gpu_power_raw, acpi_format_exception(ast));
+		pr_warn("AFNC path=%s target=%u raw=0x%x failed: %s\n",
+			gpu_power_path, gpu_power_target, gpu_power_raw,
+			acpi_format_exception(ast));
 		return -EIO;
 	}
 
-	pr_info("AFNC target=%u raw=0x%x queued\n",
-		gpu_power_target, gpu_power_raw);
+	pr_info("AFNC path=%s target=%u raw=0x%x queued\n",
+		gpu_power_path, gpu_power_target, gpu_power_raw);
 	return 0;
 }
 
@@ -645,6 +692,10 @@ static int gpu_boost_set(bool enable)
 {
 	struct gpu_power_modes before, after;
 	int ret, attempt;
+
+	ret = fan_trigger();
+	if (ret)
+		pr_warn("EC user-define trigger failed (%d), continuing\n", ret);
 
 	for (attempt = 0; attempt < 5; attempt++) {
 		ret = gpu_modes_read(&before);
@@ -664,16 +715,50 @@ static int gpu_boost_set(bool enable)
 
 		gpu_modes_log("result", &after);
 
-		if (!enable || (after.ctgp && after.ppab))
+		if (enable) {
+			if (after.ctgp && after.dtgp)
+				return 0;
+		} else if (!after.ctgp && !after.dtgp) {
 			return 0;
+		}
 
 		pr_warn("CTGP/DTGP did not stick (attempt %d/5)\n", attempt + 1);
 		msleep(500);
 	}
 
 	pr_warn("CTGP/DTGP did not stick after retries — check OGHP / thermal profile\n");
-	return 0;
+	return -EIO;
 }
+
+static void omen_disarm_unlock(const char *reason)
+{
+	int ret;
+
+	if (!omen_drv.wmi_ready)
+		return;
+
+	mutex_lock(&omen_drv.lock);
+	ret = gpu_boost_set(false);
+	mutex_unlock(&omen_drv.lock);
+	if (ret)
+		pr_emerg("failed to clear CTGP/DTGP (%s): %d\n", reason, ret);
+	else
+		pr_info("CTGP/DTGP cleared (%s)\n", reason);
+}
+
+static int omen_reboot_notify(struct notifier_block *nb, unsigned long mode,
+			      void *unused)
+{
+	(void)nb;
+	(void)mode;
+	(void)unused;
+	omen_disarm_unlock("reboot notifier");
+	return NOTIFY_OK;
+}
+
+static struct notifier_block omen_reboot_nb = {
+	.notifier_call = omen_reboot_notify,
+};
 
 static int performance_apply(void)
 {
@@ -681,7 +766,7 @@ static int performance_apply(void)
 
 	ret = fan_trigger();
 	if (ret)
-		pr_warn("fan trigger failed (%d), continuing\n", ret);
+		pr_warn("EC user-define trigger failed (%d), continuing\n", ret);
 
 	ret = thermal_profile_set(thermal_profile);
 	if (ret) {
@@ -785,8 +870,8 @@ static ssize_t gpu_state_show(struct kobject *kobj, struct kobj_attribute *attr,
 	if (ret)
 		return ret;
 
-	return sysfs_emit(buf, "ctgp=%u ppab=%u dstate=%u slowdown_temp=%u\n",
-			  m.ctgp, m.ppab, m.dstate, m.slowdown_temp);
+	return sysfs_emit(buf, "ctgp=%u dtgp=%u dstate=%u\n",
+			  m.ctgp, m.dtgp, m.dstate);
 }
 
 static ssize_t boost_store(struct kobject *kobj, struct kobj_attribute *attr,
@@ -1112,6 +1197,14 @@ static int __init omen_wmi_boost_init(void)
 		pr_info("sysfs: /sys/kernel/%s/{gpu_state,last_error,boost,performance,thermal_profile,fan_state,fan_mode,fan_speed,fan_probe}\n",
 			DRV_NAME);
 
+		ret = register_reboot_notifier(&omen_reboot_nb);
+		if (ret) {
+			pr_err("reboot notifier failed: %d\n", ret);
+			omen_sysfs_remove();
+			return ret;
+		}
+		omen_drv.reboot_nb_registered = true;
+
 		if (auto_boost) {
 			guard(mutex)(&omen_drv.lock);
 			omen_clear_last_error();
@@ -1141,6 +1234,11 @@ static int __init omen_wmi_boost_init(void)
 
 static void __exit omen_wmi_boost_exit(void)
 {
+	if (omen_drv.reboot_nb_registered) {
+		unregister_reboot_notifier(&omen_reboot_nb);
+		omen_drv.reboot_nb_registered = false;
+	}
+	omen_disarm_unlock("module exit");
 	fan_control_exit();
 	omen_sysfs_remove();
 }
@@ -1151,5 +1249,5 @@ module_exit(omen_wmi_boost_exit);
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("HP OMEN WMI GPU power unlock and fan control");
 MODULE_AUTHOR("5080_Unlock");
-MODULE_VERSION("2.0.0");
+MODULE_VERSION("2.0.2");
 MODULE_SOFTDEP("pre: wmi");

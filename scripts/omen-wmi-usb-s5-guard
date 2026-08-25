@@ -1,0 +1,101 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""Start or stop the USB-S5 shutdown inhibitor from udev or boot."""
+
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+for candidate in (SCRIPT_DIR, Path("/usr/local/lib/omen-wmi-boost")):
+    if (candidate / "omen_wmi_usb_s5.py").is_file():
+        sys.path.insert(0, str(candidate))
+        break
+
+import omen_wmi_usb_s5 as usb_s5  # noqa: E402
+
+TAG = "omen-wmi-boost"
+NOTIFIER = Path("/usr/local/sbin/omen-wmi-notify")
+
+
+def log(message: str, priority: str = "user.info") -> None:
+    subprocess.run(
+        ["logger", "-t", TAG, "-p", priority, message],
+        check=False,
+    )
+
+
+def systemctl(*args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["systemctl", *args],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+
+def notify_occupied(status: usb_s5.UsbS5Status) -> None:
+    body = f"{usb_s5.NOTIFY_BODY} Occupied: {','.join(status.ports)}."
+    log(body, "user.warning")
+    notifier = NOTIFIER if NOTIFIER.is_file() else Path("omen-wmi-notify")
+    if os.access(notifier, os.X_OK):
+        subprocess.run(
+            [str(notifier), usb_s5.NOTIFY_TITLE, body, "critical"],
+            check=False,
+        )
+
+
+def write_state(status: usb_s5.UsbS5Status) -> None:
+    usb_s5.STATE_FILE.write_text(usb_s5.format_status(status) + "\n", encoding="utf-8")
+
+
+def previous_occupied() -> bool:
+    if not usb_s5.STATE_FILE.is_file():
+        return False
+    return "state=occupied" in usb_s5.STATE_FILE.read_text(encoding="utf-8")
+
+
+def main() -> int:
+    settings = usb_s5.parse_config()
+    status = usb_s5.assess(acpi_name=settings.acpi_name)
+    was_occupied = previous_occupied()
+
+    if status.state == "undetectable":
+        if not usb_s5.UNDETECTABLE_FLAG.exists():
+            log(
+                "USB-S5 ports cannot be identified; shutdown inhibitor disabled. "
+                f"{status.reason}",
+                "user.warning",
+            )
+            usb_s5.UNDETECTABLE_FLAG.write_text(status.reason + "\n", encoding="utf-8")
+        systemctl("stop", "--no-block", usb_s5.INHIBIT_UNIT)
+        usb_s5.STATE_FILE.unlink(missing_ok=True)
+        return 0
+
+    usb_s5.UNDETECTABLE_FLAG.unlink(missing_ok=True)
+    write_state(status)
+
+    if status.occupied:
+        if settings.inhibit:
+            started = systemctl("start", "--no-block", usb_s5.INHIBIT_UNIT)
+            if started.returncode != 0:
+                log(
+                    f"failed to start {usb_s5.INHIBIT_UNIT}: {started.stderr.strip()}",
+                    "user.err",
+                )
+        else:
+            systemctl("stop", "--no-block", usb_s5.INHIBIT_UNIT)
+            log("USB-S5 occupied but usb_s5_inhibit=0; shutdown is not blocked")
+        if not was_occupied:
+            notify_occupied(status)
+        return 0
+
+    systemctl("stop", "--no-block", usb_s5.INHIBIT_UNIT)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
